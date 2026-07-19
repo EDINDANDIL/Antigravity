@@ -171,6 +171,28 @@ fn unpatch_binary(bin_path: &Path) -> Result<bool, String> {
     Ok(found)
 }
 
+
+fn kill_affected_processes() {
+    println!("\x1b[93m[INFO] Завершаем запущенные процессы перед патчингом...\x1b[0m");
+    let processes = [
+        "Antigravity.exe",
+        "Antigravity CLI.exe",
+        "agy.exe",
+        "language_server.exe",
+        "language_server_windows_x64.exe",
+        "node.exe"
+    ];
+    for p in processes.iter() {
+        Command::new("taskkill")
+            .args(&["/F", "/IM", p])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok();
+    }
+    thread::sleep(Duration::from_millis(1000));
+}
+
 fn patch_all_binaries(inst: &Path) {
     // CLI: agy.exe carries a user-facing eligibility check that we want to bypass.
     let cli = inst.join("agy.exe");
@@ -991,6 +1013,7 @@ fn get_system_gemini_api_key() -> Option<String> {
 }
 
 fn handle_patch_antigravity() {
+    kill_affected_processes();
     let installs = find_all_installs();
 
     if installs.is_empty() {
@@ -1033,6 +1056,7 @@ fn handle_patch_antigravity() {
 }
 
 fn handle_patch_gemini() {
+    kill_affected_processes();
     let gemini_cli_exists = is_gemini_cli_installed();
 
     if !gemini_cli_exists {
@@ -1268,8 +1292,6 @@ mod console_style {
     pub fn set(window_title: &str) {
         unsafe {
             std::process::Command::new("cmd").args(["/C", "color 0A"]).status().ok();
-            // Slightly narrower window than the default 120-col Windows Terminal layout.
-            std::process::Command::new("cmd").args(["/C", "mode", "con:", "cols=78", "lines=30"]).status().ok();
             let handle = GetStdHandle(STD_OUTPUT_HANDLE);
             // Enable VT processing so ANSI escapes (incl. OSC 8 hyperlinks) work in conhost.
             let mut mode: c_ulong = 0;
@@ -1366,7 +1388,7 @@ fn main() {
         println!("{}", APP_TITLE);
         println!();
         println!("1. Разблокировать Antigravity / Antigravity IDE / Antigravity CLI");
-        println!("2. Разблокировать Gemini CLI (мёртвое да восстанет!)");
+        println!("2. Разблокировать Gemini CLI (устарел)");
         println!("3. Отменить NRPT-патч (отключит исправление ошибок \"400\")");
         println!("4. Открыть Telegram-группу ({})", link("https://t.me/nova_txt", "https://t.me/nova_txt"));
         println!("5. Поблагодарить автора ({})", link("https://nova-app.eu/donate", "https://nova-app.eu/donate"));

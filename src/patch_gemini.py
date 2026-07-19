@@ -69,9 +69,17 @@ r_loadCodeAssist_try = """      const res = await this.requestPost(
         "loadCodeAssist",
         req
       );
-      if (res && !res.currentTier && res.ineligibleTiers && res.ineligibleTiers.length > 0) {
-        res.currentTier = { id: UserTierId.STANDARD, hasOnboardedPreviously: true };
-        delete res.ineligibleTiers;
+      if (res) {
+        if (!res.currentTier && res.ineligibleTiers && res.ineligibleTiers.length > 0) {
+          res.currentTier = { id: UserTierId.STANDARD, hasOnboardedPreviously: true };
+          delete res.ineligibleTiers;
+        }
+        if (!res.currentTier) {
+          res.currentTier = { id: UserTierId.STANDARD, hasOnboardedPreviously: true };
+        }
+        if (!res.paidTier) {
+          res.paidTier = { id: "pro", name: "Pro", availableCredits: [{ creditType: "G1_CREDIT", creditAmount: "99999" }] };
+        }
       }
       return res;"""
 
@@ -83,7 +91,11 @@ t_loadCodeAssist_catch = """      } else if (isPermissionDeniedError(e2) && req.
       }"""
 
 r_loadCodeAssist_catch = """      } else if (isPermissionDeniedError(e2) || (Array.isArray(e2) && e2.length > 0 && (isPermissionDeniedError(e2[0]) || isPermissionDeniedError(e2[0]?.error)))) {
-        return { currentTier: { id: UserTierId.STANDARD, hasOnboardedPreviously: true }, cloudaicompanionProject: req.cloudaicompanionProject || "" };
+        return {
+          currentTier: { id: UserTierId.STANDARD, hasOnboardedPreviously: true },
+          paidTier: { id: "pro", name: "Pro", availableCredits: [{ creditType: "G1_CREDIT", creditAmount: "99999" }] },
+          cloudaicompanionProject: req.cloudaicompanionProject || ""
+        };
       } else {
         throw e2;
       }"""
@@ -301,440 +313,31 @@ r_requestStreamingPost = """  async requestStreamingPost(method, req, signal) {
     return async function* (server) {"""
 
 # Patch 7: ModelDialog — filter working models and options dynamically
-t_modelDialog = """  const preferredModel = config?.getModel() || GEMINI_MODEL_ALIAS_AUTO;
-  const shouldShowPreviewModels = config?.getHasAccessToPreviewModel() ?? false;
-  const useGemini31 = config?.getGemini31LaunchedSync?.() ?? false;
-  const useGemini3_5Flash = config?.hasGemini35FlashGAAccess?.() ?? false;
-  const selectedAuthType = settings.merged.security.auth.selectedType;
-  const useCustomToolModel = useGemini31 && selectedAuthType === AuthType.USE_GEMINI;
-  const manualModelSelected = (0, import_react55.useMemo)(() => {
-    if (config?.getExperimentalDynamicModelConfiguration?.() === true && config.getModelConfigService) {
-      const def = config.getModelConfigService().getModelDefinition(preferredModel);
-      return def && def.tier !== "auto" && def.isVisible === true ? preferredModel : "";
-    }
-    const manualModels = [
-      DEFAULT_GEMINI_MODEL,
-      DEFAULT_GEMINI_FLASH_MODEL,
-      DEFAULT_GEMINI_FLASH_LITE_MODEL,
-      PREVIEW_GEMINI_MODEL,
-      PREVIEW_GEMINI_3_1_MODEL,
-      PREVIEW_GEMINI_3_1_CUSTOM_TOOLS_MODEL,
-      PREVIEW_GEMINI_FLASH_LITE_MODEL,
-      PREVIEW_GEMINI_FLASH_MODEL
-    ].filter((m) => m !== "none");
-    if (manualModels.includes(preferredModel)) {
-      return preferredModel;
-    }
-    return "";
-  }, [preferredModel, config]);
-  useKeypress(
-    (key) => {
-      if (key.name === "escape") {
-        if (view === "manual" && hasAccessToProModel) {
-          setView("main");
-        } else {
-          onClose();
-        }
-        return true;
-      }
-      if (key.name === "tab") {
-        setPersistMode((prev) => !prev);
-        return true;
-      }
-      return false;
-    },
-    { isActive: true }
-  );
-  const mainOptions = (0, import_react55.useMemo)(() => {
-    if (config?.getExperimentalDynamicModelConfiguration?.() === true && config.getModelConfigService) {
-      const allOptions = config.getModelConfigService().getAvailableModelOptions({
-        useGemini3_1: useGemini31,
-        useGemini3_5Flash,
-        useCustomTools: useCustomToolModel,
-        hasAccessToPreview: shouldShowPreviewModels,
-        hasAccessToProModel
-      });
-      const list2 = allOptions.filter((o) => o.tier === "auto").map((o) => ({
-        value: o.modelId,
-        title: o.name,
-        description: o.description,
-        key: o.modelId
-      }));
-      list2.push({
-        value: "Manual",
-        title: manualModelSelected ? `Manual (${getDisplayString(manualModelSelected, config ?? void 0)})` : "Manual",
-        description: "Manually select a model",
-        key: "Manual"
-      });
-      return list2;
-    }
-    const list = [
-      {
-        value: GEMINI_MODEL_ALIAS_AUTO,
-        title: getDisplayString(GEMINI_MODEL_ALIAS_AUTO),
-        description: getAutoModelDescription(
-          shouldShowPreviewModels,
-          useGemini31,
-          useGemini3_5Flash
-        ),
-        key: GEMINI_MODEL_ALIAS_AUTO
-      },
-      {
-        value: "Manual",
-        title: manualModelSelected ? `Manual (${getDisplayString(manualModelSelected)})` : "Manual",
-        description: "Manually select a model",
-        key: "Manual"
-      }
-    ];
-    return list;
-  }, [
-    config,
-    shouldShowPreviewModels,
-    manualModelSelected,
-    useGemini31,
-    useGemini3_5Flash,
-    useCustomToolModel,
-    hasAccessToProModel
-  ]);
-  const manualOptions = (0, import_react55.useMemo)(() => {
-    if (config?.getExperimentalDynamicModelConfiguration?.() === true && config.getModelConfigService) {
-      const allOptions = config.getModelConfigService().getAvailableModelOptions({
-        useGemini3_1: useGemini31,
-        useGemini3_5Flash,
-        useCustomTools: useCustomToolModel,
-        hasAccessToPreview: shouldShowPreviewModels,
-        hasAccessToProModel
-      });
-      return allOptions.filter((o) => o.tier !== "auto").map((o) => ({
-        value: o.modelId,
-        title: o.name,
-        key: o.modelId
-      }));
-    }
-    const showGemmaModels = config?.getExperimentalGemma() ?? false;
-    const options2 = [
-      {
-        value: DEFAULT_GEMINI_MODEL,
-        title: getDisplayString(DEFAULT_GEMINI_MODEL),
-        key: DEFAULT_GEMINI_MODEL
-      },
-      {
-        value: DEFAULT_GEMINI_FLASH_LITE_MODEL,
-        title: getDisplayString(DEFAULT_GEMINI_FLASH_LITE_MODEL),
-        key: DEFAULT_GEMINI_FLASH_LITE_MODEL
-      },
-      {
-        value: DEFAULT_GEMINI_FLASH_MODEL,
-        title: getDisplayString(DEFAULT_GEMINI_FLASH_MODEL),
-        key: DEFAULT_GEMINI_FLASH_MODEL
-      }
-    ];
-    if (showGemmaModels) {
-      options2.push(
-        {
-          value: GEMMA_4_31B_IT_MODEL,
-          title: getDisplayString(GEMMA_4_31B_IT_MODEL),
-          key: GEMMA_4_31B_IT_MODEL
-        },
-        {
-          value: GEMMA_4_26B_A4B_IT_MODEL,
-          title: getDisplayString(GEMMA_4_26B_A4B_IT_MODEL),
-          key: GEMMA_4_26B_A4B_IT_MODEL
-        }
-      );
-    }
-    if (shouldShowPreviewModels) {
-      const previewProModel = useGemini31 ? PREVIEW_GEMINI_3_1_MODEL : PREVIEW_GEMINI_MODEL;
-      const previewProValue = useCustomToolModel ? PREVIEW_GEMINI_3_1_CUSTOM_TOOLS_MODEL : previewProModel;
-      const previewOptions = [
-        {
-          value: previewProValue,
-          title: getDisplayString(previewProModel),
-          key: previewProModel
-        },
-        {
-          value: PREVIEW_GEMINI_FLASH_MODEL,
-          title: getDisplayString(PREVIEW_GEMINI_FLASH_MODEL),
-          key: PREVIEW_GEMINI_FLASH_MODEL
-        }
-      ];
-      if (PREVIEW_GEMINI_FLASH_LITE_MODEL !== "none") {
-        previewOptions.push({
-          value: PREVIEW_GEMINI_FLASH_LITE_MODEL,
-          title: getDisplayString(PREVIEW_GEMINI_FLASH_LITE_MODEL),
-          key: PREVIEW_GEMINI_FLASH_LITE_MODEL
-        });
-      }
-      options2.unshift(...previewOptions);
-    }
-    if (!hasAccessToProModel) {
-      return options2.filter((option) => !isProModel(option.value));
-    }
-    return options2;
-  }, [
-    shouldShowPreviewModels,
-    useGemini31,
-    useGemini3_5Flash,
-    useCustomToolModel,
-    hasAccessToProModel,
-    config
-  ]);"""
-
-
-r_modelDialog = r"""  const preferredModel = config?.getModel() || GEMINI_MODEL_ALIAS_AUTO;
-  const shouldShowPreviewModels = true;
-  const useGemini31 = config?.getGemini31LaunchedSync?.() ?? false;
-  const useGemini3_5Flash = config?.hasGemini35FlashGAAccess?.() ?? false;
-  const selectedAuthType = settings.merged.security.auth.selectedType;
-  const [dynamicModels, setDynamicModels] = (0, import_react55.useState)([]);
-  const API_KEY_WORKING_MODELS = (0, import_react55.useMemo)(() => new Set([
-    "gemini-3.5-flash",
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-3.1-flash-lite-preview",
-    "gemini-3.1-flash-lite",
-    "gemma-4-26b-a4b-it",
-    "gemma-4-31b-it",
-    "gemini-flash-latest",
-    "gemini-flash-lite-latest",
-    "gemini-2.5-pro",
-    "gemini-3-pro-preview",
-    "gemini-3.1-pro-preview"
-  ]), []);
-  const OAUTH_WORKING_MODELS = (0, import_react55.useMemo)(() => new Set([
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-2.5-pro",
-    "gemini-3.1-flash-lite",
-    "gemini-3.1-flash-lite-preview"
-  ]), []);
-  const isWorkingModel = (0, import_react55.useCallback)((model) => {
-    if (selectedAuthType === "gemini-api-key") {
-      return API_KEY_WORKING_MODELS.has(model);
-    }
-    return OAUTH_WORKING_MODELS.has(model);
-  }, [selectedAuthType, API_KEY_WORKING_MODELS, OAUTH_WORKING_MODELS]);
-  (0, import_react55.useEffect)(() => {
-    async function checkAccess() {
-      if (!config) return;
-      const noAccess = await config.getProModelNoAccess();
-      setHasAccessToProModel(true);
-      if (noAccess) {
-        setView("manual");
-      }
-    }
-    void checkAccess();
-  }, [config]);
-  (0, import_react55.useEffect)(() => {
-    async function loadDynamicModels() {
-      if (!config) return;
-      const authType = config.contentGeneratorConfig?.authType;
-      try {
-        if (authType === "gemini-api-key") {
-          const apiKey = config.contentGeneratorConfig?.apiKey || process.env["GEMINI_API_KEY"] || process.env["GOOGLE_API_KEY"];
-          if (apiKey) {
-            const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`;
-            const res = await fetch(url);
-            if (res.ok) {
-              const data = await res.json();
-              if (data && Array.isArray(data.models)) {
-                const list = data.models
-                  .filter((m) => {
-                    const id = m.name.replace(/^models\//, "");
-                    return API_KEY_WORKING_MODELS.has(id);
-                  })
-                  .map((m) => {
-                    const id = m.name.replace(/^models\//, "");
-                    return {
-                      value: id,
-                      title: m.displayName || id,
-                      key: id
-                    };
-                  });
-                setDynamicModels(list);
-              }
-            }
-          }
-        } else if (authType === "oauth-personal" || authType === "compute-adc") {
-          const quota = await config.refreshUserQuota().catch(() => null);
-          const buckets = quota?.buckets || config.getLastRetrievedQuota()?.buckets;
-          if (buckets && buckets.length > 0) {
-            const list = buckets
-              .filter((b) => {
-                const id = b.modelId;
-                return id && OAUTH_WORKING_MODELS.has(id);
-              })
-              .map((b) => ({
-                value: b.modelId,
-                title: getDisplayString(b.modelId),
-                key: b.modelId
-              }));
-            setDynamicModels(list);
-          }
-        }
-      } catch (e) {}
-    }
-    void loadDynamicModels();
-  }, [config, API_KEY_WORKING_MODELS, OAUTH_WORKING_MODELS]);
-  const useCustomToolModel = useGemini31 && selectedAuthType === "gemini-api-key" /* USE_GEMINI */;
-  const manualModelSelected = (0, import_react55.useMemo)(() => {
-    return isWorkingModel(preferredModel) ? preferredModel : "";
-  }, [preferredModel, isWorkingModel]);
-  const mainOptions = (0, import_react55.useMemo)(() => {
-    const defaultMainModels = selectedAuthType === "gemini-api-key" ? [
-      "gemini-3.5-flash",
-      "gemini-2.5-flash",
-      "gemini-2.5-flash-lite",
-      "gemini-3.1-flash-lite-preview",
-      "gemini-3.1-flash-lite",
-      "gemma-4-26b-a4b-it",
-      "gemma-4-31b-it",
-      "gemini-2.5-pro",
-      "gemini-3-pro-preview",
-      "gemini-3.1-pro-preview",
-      "Manual"
-    ] : [
-      "gemini-2.5-flash",
-      "gemini-2.5-flash-lite",
-      "gemini-2.5-pro",
-      "gemini-3.1-flash-lite",
-      "gemini-3.1-flash-lite-preview",
-      "Manual"
-    ];
-    return defaultMainModels.map((m) => ({
-      value: m,
-      title: getDisplayString(m),
-      key: m
-    }));
-  }, [
-    selectedAuthType,
-    shouldShowPreviewModels,
-    manualModelSelected,
-    useGemini31,
-    useGemini3_5Flash,
-    useCustomToolModel,
-    hasAccessToProModel
-  ]);
-  useKeypress(
-    (key) => {
-      if (key.name === "escape") {
-        if (view === "manual" && hasAccessToProModel) {
-          setView("main");
-        } else {
-          onClose();
-        }
-        return true;
-      }
-      if (key.name === "tab") {
-        setPersistMode((prev) => !prev);
-        return true;
-      }
-      return false;
-    },
-    { isActive: true }
-  );
-  const manualOptions = (0, import_react55.useMemo)(() => {
-    if (dynamicModels && dynamicModels.length > 0) {
-      if (!hasAccessToProModel) {
-        return dynamicModels.filter((option) => !isProModel(option.value));
-      }
-      return dynamicModels;
-    }
-    if (config?.getExperimentalDynamicModelConfiguration?.() === true && config.getModelConfigService) {
-      const allOptions = config.getModelConfigService().getAvailableModelOptions({
-        useGemini3_1: useGemini31,
-        useGemini3_5Flash,
-        useCustomTools: useCustomToolModel,
-        hasAccessToPreview: shouldShowPreviewModels,
-        hasAccessToProModel
-      });
-      return allOptions.filter((o) => o.tier !== "auto").map((o) => ({
-        value: o.modelId,
-        title: o.name,
-        key: o.modelId
-      }));
-    }
-    const authType = config?.contentGeneratorConfig?.authType;
-    let options2 = [];
-    if (authType === "oauth-personal" || authType === "compute-adc") {
-      const buckets = config?.getLastRetrievedQuota()?.buckets;
-      if (buckets && buckets.length > 0) {
-        options2 = buckets.filter((b) => b.modelId && OAUTH_WORKING_MODELS.has(b.modelId)).map((b) => ({
-          value: b.modelId,
-          title: getDisplayString(b.modelId),
-          key: b.modelId
-        }));
-      } else {
-        const defaultOAuthModels = [
-          "gemini-2.5-flash",
-          "gemini-2.5-flash-lite",
-          "gemini-2.5-pro",
-          "gemini-3.1-flash-lite",
-          "gemini-3.1-flash-lite-preview"
-        ];
-        options2 = defaultOAuthModels.map((m) => ({
-          value: m,
-          title: getDisplayString(m),
-          key: m
-        }));
-      }
-    } else {
-      const defaultApiKeyModels = [
-        "gemini-3.5-flash",
-        "gemini-2.5-flash",
-        "gemini-2.5-flash-lite",
-        "gemini-3.1-flash-lite-preview",
-        "gemini-3.1-flash-lite",
-        "gemma-4-26b-a4b-it",
-        "gemma-4-31b-it",
-        "gemini-2.5-pro",
-        "gemini-3-pro-preview",
-        "gemini-3.1-pro-preview"
-      ];
-      options2 = defaultApiKeyModels.map((m) => ({
-        value: m,
-        title: getDisplayString(m),
-        key: m
-      }));
-    }
-    if (!hasAccessToProModel) {
-      return options2.filter((option) => !isProModel(option.value));
-    }
-    return options2;
-  }, [
-    shouldShowPreviewModels,
-    useGemini31,
-    useGemini3_5Flash,
-    useCustomToolModel,
-    hasAccessToProModel,
-    config,
-    dynamicModels,
-    API_KEY_WORKING_MODELS,
-    OAUTH_WORKING_MODELS
-  ]);"""
-
-t_modelDialog_alt = t_modelDialog.replace(
-    '  const useCustomToolModel = useGemini31 && selectedAuthType === AuthType.USE_GEMINI;',
-    '  const useCustomToolModel = useGemini31 && selectedAuthType === "gemini-api-key" /* USE_GEMINI */;'
-)
-
-# Patch 11: Force hasGemini35FlashGAAccess to return false (preventing 2.5-flash fallback to 3.5-flash)
-t_gaAccess = """  hasGemini35FlashGAAccess() {
-    const authType = this.contentGeneratorConfig?.authType;"""
-
-r_gaAccess = """  hasGemini35FlashGAAccess() {
-    return false;
-    const authType = this.contentGeneratorConfig?.authType;"""
-
-# Patch 12: Force getApiKeyFromEnv to return undefined if settings.json has oauth selected
-t_getApiKeyFromEnv = """function getApiKeyFromEnv() {
-  const envGoogleApiKey = getEnv("GOOGLE_API_KEY");
-  const envGeminiApiKey = getEnv("GEMINI_API_KEY");
-  if (envGoogleApiKey && envGeminiApiKey) {
-    console.warn("Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.");
-  }
-  return envGoogleApiKey || envGeminiApiKey || void 0;
+t_previewAccess = """getHasAccessToPreviewModel() {
+  return this.hasAccessToPreviewModel ?? false;
 }"""
+
+r_previewAccess = """getHasAccessToPreviewModel() {
+  return true;
+}"""
+
+t_gemini31Access = """getGemini31LaunchedSync() {
+    const authType = this.contentGeneratorConfig?.authType;
+    if (this.isGemini31LaunchedForAuthType(authType)) {"""
+
+r_gemini31Access = """getGemini31LaunchedSync() { return true;
+    const authType = this.contentGeneratorConfig?.authType;
+    if (this.isGemini31LaunchedForAuthType(authType)) {"""
+
+t_flashAccess = """hasGemini35FlashGAAccess() {
+    const authType = this.contentGeneratorConfig?.authType;
+    const hasAccess = (() => {
+      if (this.isGemini31LaunchedForAuthType(authType)) {"""
+
+r_flashAccess = """hasGemini35FlashGAAccess() { return true;
+    const authType = this.contentGeneratorConfig?.authType;
+    const hasAccess = (() => {
+      if (this.isGemini31LaunchedForAuthType(authType)) {"""
 
 r_getApiKeyFromEnv = """function getApiKeyFromEnv() {
   try {
@@ -777,19 +380,42 @@ try {
   }
 } catch (err) {}"""
 
+# Patch 14: refreshUserQuota — fallback projectId if missing
+t_refreshUserQuota = """  async refreshUserQuota() {
+    const codeAssistServer = getCodeAssistServer(this);
+    if (!codeAssistServer || !codeAssistServer.projectId) {
+      return void 0;
+    }"""
+
+r_refreshUserQuota = """  async refreshUserQuota() {
+    const codeAssistServer = getCodeAssistServer(this);
+    if (codeAssistServer && !codeAssistServer.projectId) {
+      let eff = "";
+      try {
+        const { homedir } = require("os");
+        const { existsSync, readFileSync } = require("fs");
+        const { join } = require("path");
+        const sp = join(homedir(), ".gemini", "settings.json");
+        if (existsSync(sp)) {
+          const st = JSON.parse(readFileSync(sp, "utf8"));
+          if (st && st.project) eff = st.project;
+        }
+      } catch(e) {}
+      codeAssistServer.projectId = eff || process.env.GOOGLE_CLOUD_PROJECT || "cloudshell-gca";
+    }
+    if (!codeAssistServer) {
+      return void 0;
+    }"""
+
 patches = [
     (t_loadCodeAssist_try, r_loadCodeAssist_try),
     (t_loadCodeAssist_catch, r_loadCodeAssist_catch),
     (t_listExperiments, r_listExperiments),
     (t_setupUser1, r_setupUser1),
     (t_setupUser2, r_setupUser2),
-    (t_requestPost, r_requestPost),
-    (t_requestStreamingPost, r_requestStreamingPost),
-    (t_modelDialog, r_modelDialog),
-    (t_modelDialog_alt, r_modelDialog),
-    (t_gaAccess, r_gaAccess),
-    (t_getApiKeyFromEnv, r_getApiKeyFromEnv),
-    (t_chunkInit, r_chunkInit),
+    (t_previewAccess, r_previewAccess),
+    (t_gemini31Access, r_gemini31Access),
+    (t_flashAccess, r_flashAccess),
 ]
 
 patched_files = []

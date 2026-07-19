@@ -1,4 +1,4 @@
-VERSION = "2.2.1"
+VERSION = "2.2.1.1"
 
 import os
 import random
@@ -19,10 +19,13 @@ def replace_in_file(filepath, old_str, new_str):
         f.write(content)
 
 def main():
-    print("=== Antigravity Secure Rust Builder ===")
+    # Set correct working directory to where this script is located
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
+    print("[INFO] Starting build process...")
 
+    VERSION = "2.3.1"
     version = VERSION
-    print(f"[INFO] Выбранная версия сборки: {version}")
+    print(f"[INFO] Build version: {version}")
 
     # 1. Load or generate secrets
     secrets_path = ".secrets.json"
@@ -292,7 +295,15 @@ if __name__ == "__main__":
         with open(dist_keygen_path, 'w', encoding='utf-8') as f:
             f.write(keygen_code)
     
-    # 3. Build Rust project
+    # 3. Sync version in Cargo.toml (strip to MAJOR.MINOR.PATCH for semver)
+    cargo_version = ".".join(version.split(".")[:3])
+    with open("Cargo.toml", 'r', encoding='utf-8') as f:
+        cargo_content = f.read()
+    cargo_content = re.sub(r'^version\s*=\s*"[^"]*"', f'version = "{cargo_version}"', cargo_content, flags=re.MULTILINE)
+    with open("Cargo.toml", 'w', encoding='utf-8') as f:
+        f.write(cargo_content)
+
+    # 4. Build Rust project
     print("[INFO] Запуск компиляции (Release mode)...")
     
     cargo_cmd = ["cargo", "build", "--release"]

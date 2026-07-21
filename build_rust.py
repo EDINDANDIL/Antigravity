@@ -1,5 +1,3 @@
-VERSION = "2.2.1.1"
-
 import os
 import random
 import re
@@ -23,7 +21,7 @@ def main():
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     print("[INFO] Starting build process...")
 
-    VERSION = "2.3.1"
+    VERSION = "2.3.1.2"
     version = VERSION
     print(f"[INFO] Build version: {version}")
 
@@ -44,9 +42,10 @@ def main():
         license_secret = generate_secret(32)
 
     main_rs_path = r"src\main.rs"
+    auth_rs_path = r"src\auth.rs"
     
     # 2. Inject secrets and version
-    replace_in_file(main_rs_path, "___LICENSE_SECRET___", license_secret)
+    replace_in_file(auth_rs_path, "___LICENSE_SECRET___", license_secret)
     replace_in_file(main_rs_path, "___APP_VERSION___", version)
     
     keygen_code = """import sys
@@ -321,6 +320,14 @@ if __name__ == "__main__":
             os.remove(out_path)
         shutil.move(r"target\release\ag_unlocker.exe", out_path)
         
+        # Compress with UPX if available
+        print("[INFO] Сжатие исполняемого файла с помощью UPX...")
+        try:
+            subprocess.run(["upx", "--best", "--lzma", out_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print("[INFO] Исполняемый файл успешно сжат с помощью UPX.")
+        except Exception as e:
+            print(f"[WARNING] Не удалось сжать файл с помощью UPX: {e}")
+        
         print("\n[УСПЕХ] Сборка завершена!")
         print(f"Ваш исполняемый файл: {out_path}")
         
@@ -338,7 +345,7 @@ if __name__ == "__main__":
         print(f"\n[ОШИБКА] Сборка завершилась с ошибкой: {e}")
     finally:
         # 5. Revert secrets and version to placeholders so they don't stay in source code
-        replace_in_file(main_rs_path, license_secret, "___LICENSE_SECRET___")
+        replace_in_file(auth_rs_path, license_secret, "___LICENSE_SECRET___")
         replace_in_file(main_rs_path, version, "___APP_VERSION___")
 
         # 6. Clean target folder to save space and keep repository clean

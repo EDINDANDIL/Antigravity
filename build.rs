@@ -7,8 +7,8 @@ fn main() {
         res.set("FileDescription", "Antigravity Configuration Tool");
         res.set("ProductName", "Antigravity Configurator");
         res.set("LegalCopyright", "Brent t.me/nova_txt");
-        res.set("FileVersion", "2026.06.15.0");
-        res.set("ProductVersion", "2026.06.15.0");
+        res.set("FileVersion", "2.3.1.2");
+        res.set("ProductVersion", "2.3.1.2");
         res.compile().unwrap();
     }
 }

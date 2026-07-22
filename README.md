@@ -14,8 +14,8 @@
 Для разблокировки нужно ввести бесплатный лицензионный код, взять можно из группы (в закреплённых сообщениях) [t.me/nova_txt](https://t.me/nova_txt/69864)
 
 # Как разблокировать Antigravity?
-1) скачиваете Antigravity с официального сайта [https://antigravity.google/download](https://antigravity.google/download) и устанавливаете (пока не запускайте)
-2) применяете анлокер, после этого его можно закрыть
+1) скачиваете Antigravity/Antigravity IDE/Antigravity CLI с официального сайта [https://antigravity.google/download](https://antigravity.google/download) и устанавливаете
+2) применяете анлокер
 3) запускаете Antigravity и входите в аккаунт Google
 
 # Работает ли анлокер для 2+ версии?

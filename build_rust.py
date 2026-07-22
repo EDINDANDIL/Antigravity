@@ -3,11 +3,19 @@ import random
 import re
 import string
 import subprocess
+import sys
 import time
 
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
+
 def generate_secret(length=32):
-    chars = string.ascii_letters + string.digits + "!@#$%^&*()_+-=[]{}|;:,.<>?"
+    chars = string.ascii_letters + string.digits
     return ''.join(random.choices(chars, k=length))
+
 
 def replace_in_file(filepath, old_str, new_str):
     with open(filepath, 'r', encoding='utf-8') as f:
@@ -21,7 +29,7 @@ def main():
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     print("[INFO] Starting build process...")
 
-    VERSION = "2.3.1.2"
+    VERSION = "2.3.1.3"
     version = VERSION
     print(f"[INFO] Build version: {version}")
 

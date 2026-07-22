@@ -29,13 +29,112 @@ const APP_TITLE: &str = "Antigravity Unlocker 2";
 // to bump everywhere (binary file name and any future version display).
 const APP_VERSION: &str = "___APP_VERSION___";
 
+fn clean_input_path(input: &str) -> String {
+    let mut s = input.trim();
+    if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
+        if s.len() >= 2 {
+            s = &s[1..s.len() - 1];
+        }
+    }
+    s = s.trim();
+    s = s.trim_matches('"').trim_matches('\'').trim();
+    s.to_string()
+}
+
+fn is_install_root(path: &Path) -> bool {
+    if !path.exists() || !path.is_dir() {
+        return false;
+    }
+
+    let path_str = path.to_string_lossy().to_lowercase();
+    if path_str == "c:\\windows"
+        || path_str.starts_with("c:\\windows\\")
+        || path_str.contains("\\windows\\system32")
+        || path_str.contains("\\windows\\syswow64")
+    {
+        return false;
+    }
+
+    let resources = path.join("resources");
+    if resources.exists() && resources.is_dir() {
+        if resources.join("app.asar").exists()
+            || resources.join("app").exists()
+            || resources.join("bin").exists()
+        {
+            return true;
+        }
+    }
+    if path.join("agy.exe").exists() {
+        return true;
+    }
+    if path.join("Antigravity.exe").exists()
+        || path.join("Antigravity IDE.exe").exists()
+        || path.join("antigravity.exe").exists()
+    {
+        return true;
+    }
+    if path.join("out").join("main.js").exists() || path.join("dist").join("main.js").exists() {
+        return true;
+    }
+    false
+}
+
+pub fn resolve_install_root(raw: &Path) -> Option<PathBuf> {
+    let mut p = raw.to_path_buf();
+
+    if p.is_file() {
+        if let Some(parent) = p.parent() {
+            p = parent.to_path_buf();
+        }
+    }
+
+    if !p.exists() {
+        return None;
+    }
+
+    if is_install_root(&p) {
+        return Some(p);
+    }
+
+    let mut current = p.clone();
+    for _ in 0..4 {
+        if let Some(parent) = current.parent() {
+            if is_install_root(parent) {
+                return Some(parent.to_path_buf());
+            }
+            current = parent.to_path_buf();
+        } else {
+            break;
+        }
+    }
+
+    let subfolder_candidates = [
+        "Antigravity IDE",
+        "Antigravity",
+        "agy",
+        "Programs\\Antigravity IDE",
+        "Programs\\Antigravity",
+        "resources",
+    ];
+    for sub in subfolder_candidates {
+        let candidate = p.join(sub);
+        if is_install_root(&candidate) {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
 fn find_all_installs() -> Vec<PathBuf> {
     let mut installs = Vec::new();
+    let mut candidates = Vec::new();
+
     let local_appdata = env::var("LOCALAPPDATA").unwrap_or_default();
     let prog_files = env::var("PROGRAMFILES").unwrap_or_default();
     let prog_files_x86 = env::var("PROGRAMFILES(X86)").unwrap_or_default();
-    
-    let candidates = vec![
+
+    let standard_paths = vec![
         PathBuf::from(&local_appdata).join("Programs").join("Antigravity"),
         PathBuf::from(&prog_files).join("Antigravity"),
         PathBuf::from(&prog_files_x86).join("Antigravity"),
@@ -44,17 +143,78 @@ fn find_all_installs() -> Vec<PathBuf> {
         PathBuf::from(&prog_files).join("Antigravity IDE"),
         PathBuf::from(&prog_files_x86).join("Antigravity IDE"),
         PathBuf::from(&local_appdata).join("Antigravity IDE"),
-        PathBuf::from("D:\\Programs\\Antigravity IDE"),
-        PathBuf::from("C:\\Programs\\Antigravity IDE"),
-        PathBuf::from(&local_appdata).join("agy").join("bin")
+        PathBuf::from(&local_appdata).join("agy").join("bin"),
+        PathBuf::from(&local_appdata).join("agy"),
     ];
-    
-    for path in candidates {
-        if path.exists() && path.is_dir() {
-            if path.join("resources").exists() && !installs.contains(&path) {
-                installs.push(path.clone());
-            } else if path.join("agy.exe").exists() && !installs.contains(&path) {
-                installs.push(path.clone());
+    candidates.extend(standard_paths);
+
+    for drive_letter in b'C'..=b'Z' {
+        let drive_str = format!("{}:\\", drive_letter as char);
+        let drive_path = Path::new(&drive_str);
+        if drive_path.exists() {
+            let drive_subfolders = [
+                "Antigravity IDE",
+                "Antigravity",
+                "agy",
+                "Programs\\Antigravity IDE",
+                "Programs\\Antigravity",
+                "Programs\\agy",
+                "Program Files\\Antigravity IDE",
+                "Program Files\\Antigravity",
+                "Program Files (x86)\\Antigravity IDE",
+                "Program Files (x86)\\Antigravity",
+                "Apps\\Antigravity IDE",
+                "Apps\\Antigravity",
+                "Software\\Antigravity IDE",
+                "Software\\Antigravity",
+                "Dev\\Antigravity IDE",
+                "Dev\\Antigravity",
+                "Tools\\Antigravity IDE",
+                "Tools\\Antigravity",
+            ];
+            for sub in drive_subfolders {
+                candidates.push(drive_path.join(sub));
+            }
+        }
+    }
+
+    if let Ok(path_var) = env::var("PATH") {
+        for p in path_var.split(';') {
+            let p_trim = clean_input_path(p);
+            let p_lower = p_trim.to_lowercase();
+            if !p_trim.is_empty()
+                && !p_lower.contains("\\windows")
+                && !p_lower.contains("\\system32")
+                && !p_lower.contains("\\syswow64")
+            {
+                candidates.push(PathBuf::from(p_trim));
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let ps_cmd = r#"Get-ItemProperty HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*, HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*, HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\* | Where-Object { $_.DisplayName -like '*Antigravity*' -or $_.DisplayName -like '*agy*' -or $_.InstallLocation -like '*Antigravity*' } | ForEach-Object { $_.InstallLocation; $_.UninstallString }"#;
+        if let Ok(output) = Command::new("powershell")
+            .args(["-NoProfile", "-Command", ps_cmd])
+            .output()
+        {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for line in stdout.lines() {
+                    let cleaned = clean_input_path(line);
+                    if !cleaned.is_empty() {
+                        candidates.push(PathBuf::from(&cleaned));
+                    }
+                }
+            }
+        }
+    }
+
+    for cand in candidates {
+        if let Some(resolved) = resolve_install_root(&cand) {
+            if !installs.contains(&resolved) {
+                installs.push(resolved);
             }
         }
     }
@@ -73,10 +233,6 @@ fn process_install(install: &Path) -> Result<String, String> {
 
     // Patch all relevant binaries (Language Server / CLI)
     patch_all_binaries(install);
-
-    if install.join("agy.exe").exists() {
-        return Ok("Antigravity CLI".to_string());
-    }
 
     let resources = install.join("resources");
     let app_dir = resources.join("app");
@@ -104,6 +260,8 @@ fn process_install(install: &Path) -> Result<String, String> {
     } else if desktop_js.exists() {
         patch_desktop(install, &desktop_js)?;
         return Ok("Antigravity Desktop".to_string());
+    } else if install.join("agy.exe").exists() {
+        return Ok("Antigravity CLI".to_string());
     }
 
     Err("Компоненты приложения не найдены".to_string())
@@ -487,6 +645,70 @@ fn handle_patch_gemini() {
     print_results(&successes, &failures);
 }
 
+fn handle_manual_path() {
+    clear_screen();
+    println!("{}", APP_TITLE);
+    println!("\n============================================================");
+    println!("Указать путь к Antigravity вручную");
+    println!("Вставьте путь к папке установки или исполняемому файлу");
+    println!("(с кавычками или без, например: D:\\Antigravity IDE)");
+    println!("------------------------------------------------------------");
+    print!("> ");
+    io::stdout().flush().unwrap();
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).unwrap_or(0);
+
+    let cleaned = clean_input_path(&input);
+    if cleaned.is_empty() {
+        return;
+    }
+
+    let input_path = PathBuf::from(&cleaned);
+
+    println!("{}", "--------------------------------------------------");
+    let resolved = match resolve_install_root(&input_path) {
+        Some(path) => path,
+        None => {
+            println!("\x1b[33m[ERR] По указанному пути установка Antigravity не найдена.\x1b[0m\x1b[92m");
+            println!("Проверьте правильность пути: {}", cleaned);
+            println!("\nЧтобы вернуться в главное меню, нажмите Enter");
+            let mut wait = String::new();
+            io::stdin().read_line(&mut wait).ok();
+            return;
+        }
+    };
+
+    println!("{} {}", "Обработка:", mask_path(&resolved.display().to_string()));
+
+    let mut successes = Vec::new();
+    let mut failures = Vec::new();
+
+    match process_install(&resolved) {
+        Ok(name) => {
+            println!("{} {}", "[OK] Успешно пропатчено:", name);
+            successes.push(name);
+        }
+        Err(e) => {
+            println!("\x1b[33m[ERR] Ошибка: {}\x1b[0m\x1b[92m", e);
+            failures.push(format!("{} - {}", mask_path(&resolved.display().to_string()), e));
+        }
+    }
+
+    if (!successes.is_empty() || !failures.is_empty()) && is_admin() {
+        if !is_nrpt_applied() {
+            print!("\nПатч для Google серверов... ");
+            io::stdout().flush().ok();
+            match setup_dns_nrpt() {
+                Ok(_) => println!("OK"),
+                Err(_) => println!("пропущено"),
+            }
+        }
+    }
+
+    print_results(&successes, &failures);
+}
+
 fn show_admin_prewarning() {
     clear_screen();
     println!("{}", APP_TITLE);
@@ -527,6 +749,7 @@ fn main() {
         println!("3. Отменить NRPT-патч (отключит исправление ошибок \"400\")");
         println!("4. Открыть Telegram-группу ({})", link("https://t.me/nova_txt", "https://t.me/nova_txt"));
         println!("5. Поблагодарить автора ({})", link("https://nova-app.eu/donate", "https://nova-app.eu/donate"));
+        println!("6. Указать путь к Antigravity вручную");
         println!("0. Выход");
         println!();
         if !is_admin() && !is_nrpt_applied() {
@@ -545,6 +768,7 @@ fn main() {
             "3" => handle_restore_dns(),
             "4" => open_url("https://t.me/nova_txt"),
             "5" => open_url("https://nova-app.eu/donate"),
+            "6" => handle_manual_path(),
             "0" => break,
             _ => {
                 println!("{}", "Неверный выбор.");

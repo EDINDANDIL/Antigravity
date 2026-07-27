@@ -58,10 +58,33 @@ pub fn patch_ide(_inst: &Path, main_js: &Path) -> Result<(), String> {
     }
 }
 
-pub fn patch_desktop(_inst: &Path, main_js: &Path) -> Result<(), String> {
+/// v2.4+ Desktop: modular Electron shell, auth lives in Language Server binary.
+fn is_new_desktop_architecture(content: &str) -> bool {
+    let modular = content.contains("./languageServer")
+        && content.contains("./ipcHandlers");
+    let legacy_auth = content.contains("_handleAuthErrorResponse")
+        || content.contains("getUserStatus")
+        || content.contains("\"AUTH_SUCCESS\"")
+        || content.contains("\"SET_INELIGIBLE\"");
+    modular && !legacy_auth
+}
+
+pub fn patch_desktop(_inst: &Path, main_js: &Path) -> Result<bool, String> {
     let content = fs::read_to_string(main_js).map_err(|e| e.to_string())?;
 
     let cleaned = strip_desktop_hook(&content);
+
+    // v2.4+: auth handled entirely by Language Server binary (patched separately).
+    // No JS modification needed — skip proxy hook and inline patches.
+    if is_new_desktop_architecture(&cleaned) {
+        if cleaned != content {
+            fs::write(main_js, &cleaned).map_err(|e| e.to_string())?;
+            println!("  [INFO] Удалён устаревший JS-патч");
+        }
+        println!("  [INFO] v2.4+ архитектура — JS-патч не требуется (auth в Language Server)");
+        return Ok(false);
+    }
+
     let inline_patched = apply_desktop_inline_patches(&cleaned);
 
     obfstr::obfstr! {
@@ -229,7 +252,7 @@ _elec.app.whenReady = function() {
 
     let new_content = format!("{}\n{}\n// UNLOCKED", hook, inline_patched);
     fs::write(main_js, new_content).map_err(|e| e.to_string())?;
-    Ok(())
+    Ok(true)
 }
 
 fn strip_desktop_hook(content: &str) -> String {

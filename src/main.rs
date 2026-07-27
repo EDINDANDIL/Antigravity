@@ -136,65 +136,21 @@ fn find_all_installs() -> Vec<PathBuf> {
 
     let standard_paths = vec![
         PathBuf::from(&local_appdata).join("Programs").join("Antigravity"),
-        PathBuf::from(&prog_files).join("Antigravity"),
-        PathBuf::from(&prog_files_x86).join("Antigravity"),
-        PathBuf::from(&local_appdata).join("Antigravity"),
         PathBuf::from(&local_appdata).join("Programs").join("Antigravity IDE"),
+        PathBuf::from(&prog_files).join("Antigravity"),
         PathBuf::from(&prog_files).join("Antigravity IDE"),
+        PathBuf::from(&prog_files_x86).join("Antigravity"),
         PathBuf::from(&prog_files_x86).join("Antigravity IDE"),
+        PathBuf::from(&local_appdata).join("Antigravity"),
         PathBuf::from(&local_appdata).join("Antigravity IDE"),
         PathBuf::from(&local_appdata).join("agy").join("bin"),
         PathBuf::from(&local_appdata).join("agy"),
     ];
     candidates.extend(standard_paths);
 
-    for drive_letter in b'C'..=b'Z' {
-        let drive_str = format!("{}:\\", drive_letter as char);
-        let drive_path = Path::new(&drive_str);
-        if drive_path.exists() {
-            let drive_subfolders = [
-                "Antigravity IDE",
-                "Antigravity",
-                "agy",
-                "Programs\\Antigravity IDE",
-                "Programs\\Antigravity",
-                "Programs\\agy",
-                "Program Files\\Antigravity IDE",
-                "Program Files\\Antigravity",
-                "Program Files (x86)\\Antigravity IDE",
-                "Program Files (x86)\\Antigravity",
-                "Apps\\Antigravity IDE",
-                "Apps\\Antigravity",
-                "Software\\Antigravity IDE",
-                "Software\\Antigravity",
-                "Dev\\Antigravity IDE",
-                "Dev\\Antigravity",
-                "Tools\\Antigravity IDE",
-                "Tools\\Antigravity",
-            ];
-            for sub in drive_subfolders {
-                candidates.push(drive_path.join(sub));
-            }
-        }
-    }
-
-    if let Ok(path_var) = env::var("PATH") {
-        for p in path_var.split(';') {
-            let p_trim = clean_input_path(p);
-            let p_lower = p_trim.to_lowercase();
-            if !p_trim.is_empty()
-                && !p_lower.contains("\\windows")
-                && !p_lower.contains("\\system32")
-                && !p_lower.contains("\\syswow64")
-            {
-                candidates.push(PathBuf::from(p_trim));
-            }
-        }
-    }
-
     #[cfg(target_os = "windows")]
     {
-        let ps_cmd = r#"Get-ItemProperty HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*, HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*, HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\* | Where-Object { $_.DisplayName -like '*Antigravity*' -or $_.DisplayName -like '*agy*' -or $_.InstallLocation -like '*Antigravity*' } | ForEach-Object { $_.InstallLocation; $_.UninstallString }"#;
+        let ps_cmd = r#"Get-ItemProperty HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*, HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*, HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\* | Where-Object { $_.DisplayName -like '*Antigravity*' -or $_.DisplayName -like '*agy*' -or $_.InstallLocation -like '*Antigravity*' } | ForEach-Object { $_.InstallLocation }"#;
         if let Ok(output) = Command::new("powershell")
             .args(["-NoProfile", "-Command", ps_cmd])
             .output()
@@ -258,7 +214,15 @@ fn process_install(install: &Path) -> Result<String, String> {
         }
         return Ok("Antigravity IDE".to_string());
     } else if desktop_js.exists() {
-        patch_desktop(install, &desktop_js)?;
+        let js_patched = patch_desktop(install, &desktop_js)?;
+        if !js_patched {
+            // v2.4+: JS-патч не нужен, восстанавливаем оригинальный app.asar
+            let _ = fs::remove_dir_all(&app_dir);
+            let asar_bak = resources.join("app.asar.bak");
+            if asar_bak.exists() {
+                let _ = fs::rename(&asar_bak, &app_asar);
+            }
+        }
         return Ok("Antigravity Desktop".to_string());
     } else if install.join("agy.exe").exists() {
         return Ok("Antigravity CLI".to_string());

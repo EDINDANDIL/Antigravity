@@ -29,7 +29,7 @@ def main():
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     print("[INFO] Starting build process...")
 
-    VERSION = "2.3.1.3"
+    VERSION = "2.4.2"
     version = VERSION
     print(f"[INFO] Build version: {version}")
 

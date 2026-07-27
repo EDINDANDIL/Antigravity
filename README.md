@@ -31,5 +31,4 @@
 
 🙋 Группа в ТГ: [t.me/nova_txt](https://t.me/nova_txt)
 
-Поблагодарить (не обязательно): [nova-app.eu/donate](https://nova-app.eu/donate/)
 

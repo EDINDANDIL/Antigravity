@@ -20,10 +20,10 @@
 
 # Работает ли анлокер для 2+ версии?
 Да, он работает для всех агентских программ для кодинга от Google:
-- Antigravity
+- Antigravity 2.0
 - Antigravity IDE
 - Antigravity CLI
-- Gemini CLI (только при наличии платных подписок Гугла)
+- Gemini CLI
 
 # На virustotal есть срабатывания. Почему?
 

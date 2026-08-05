@@ -7,8 +7,10 @@ fn main() {
         res.set("FileDescription", "Antigravity Configuration Tool");
         res.set("ProductName", "Antigravity Configurator");
         res.set("LegalCopyright", "Brent t.me/nova_txt");
-        res.set("FileVersion", "2.3.1.2");
-        res.set("ProductVersion", "2.3.1.2");
+        // Kept in step with Cargo.toml, which build_rust.py rewrites per release.
+        let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
+        res.set("FileVersion", &version);
+        res.set("ProductVersion", &version);
         res.compile().unwrap();
     }
 }

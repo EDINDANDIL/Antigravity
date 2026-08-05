@@ -1,19 +1,31 @@
 use std::env;
-use std::io;
+use std::io::{self, Write};
 use std::process::Command;
 
 pub fn clear_screen() {
-    if cfg!(target_os = "windows") {
-        Command::new("cmd").args(["/C", "cls"]).status().unwrap();
-    } else {
-        print!("{}[2J{}[1;1H", 27 as char, 27 as char);
-    }
+    // VT is enabled at startup, so the escape sequence works everywhere and
+    // avoids spawning a cmd.exe just to clear the screen.
+    print!("\x1b[2J\x1b[3J\x1b[1;1H");
+    io::stdout().flush().ok();
 }
 
-// Format a URL for display. Standard ANSI formatting is used so that the
-// terminal's built-in URI auto-detection recognizes the link.
+/// True when the host terminal renders OSC 8 hyperlinks (Windows Terminal and
+/// most modern emulators). The legacy conhost window does not, so links are
+/// printed as plain text there and opened through the menu instead.
+pub fn supports_hyperlinks() -> bool {
+    env::var("WT_SESSION").is_ok()
+        || env::var("TERM_PROGRAM").is_ok()
+        || env::var("ConEmuANSI").map(|v| v == "ON").unwrap_or(false)
+}
+
+// Format a URL for display. On terminals that support it the text becomes a
+// real hyperlink (Ctrl+Click); elsewhere it stays a readable, selectable URL.
 pub fn link(url: &str, text: &str) -> String {
-    format!("\x1b[94;4m\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\\x1b[0m\x1b[92m", url, text)
+    if supports_hyperlinks() {
+        format!("\x1b[94;4m\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\\x1b[0m\x1b[92m", url, text)
+    } else {
+        format!("\x1b[94;4m{}\x1b[0m\x1b[92m", text)
+    }
 }
 
 // Open a URL in the system default browser (Windows: cmd /c start "" <url>).
@@ -25,6 +37,24 @@ pub fn open_url(url: &str) {
     #[cfg(not(target_os = "windows"))]
     {
         Command::new("xdg-open").arg(url).status().ok();
+    }
+}
+
+/// Prints a prompt and returns the trimmed line the user typed.
+pub fn prompt(label: &str) -> String {
+    print!("{}", label);
+    io::stdout().flush().ok();
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).unwrap_or(0);
+    input.trim().to_string()
+}
+
+/// Hint shown next to any printed link, telling the user how to follow it.
+pub fn open_hint(keyword: &str) -> String {
+    if supports_hyperlinks() {
+        format!("(Ctrl+клик по ссылке, либо введите '{}' чтобы открыть в браузере)", keyword)
+    } else {
+        format!("(введите '{}' чтобы открыть в браузере)", keyword)
     }
 }
 

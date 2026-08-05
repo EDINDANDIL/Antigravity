@@ -15,19 +15,23 @@ mod patch_binary;
 mod patch_ide;
 mod patch_gemini;
 
-use utils::{clear_screen, link, open_url, mask_path, is_admin, print_results};
+use utils::{clear_screen, link, open_url, mask_path, is_admin, print_results, prompt, open_hint};
 use auth::login_screen;
-use dns::{setup_dns_nrpt, remove_dns_nrpt, is_nrpt_applied};
+use dns::{setup_dns_nrpt, setup_dns_nrpt_with, remove_dns_nrpt, is_nrpt_applied};
 use asar::extract_asar;
-use patch_binary::{kill_affected_processes, patch_all_binaries};
-use patch_ide::{patch_ide, patch_desktop, patch_extension_js};
+use patch_binary::{kill_affected_processes, patch_all_binaries, unpatch_all_binaries};
+use patch_ide::{patch_ide, patch_desktop, patch_extension_js, is_new_desktop_architecture};
 use patch_gemini::run_gemini_patcher;
 
 // Title shown at the top of the main menu.
 const APP_TITLE: &str = "Antigravity Unlocker 2";
-// Version is read from Cargo.toml at compile time. Bump version in Cargo.toml
-// to bump everywhere (binary file name and any future version display).
-const APP_VERSION: &str = "___APP_VERSION___";
+// Version is read from Cargo.toml at compile time (build_rust.py keeps
+// Cargo.toml in sync). Bumping the version here also rotates the license keys,
+// since keys are salted with this value in auth.rs.
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+const TELEGRAM_URL: &str = "https://t.me/nova_txt";
+const DONATE_URL: &str = "https://nova-app.eu/donate";
 
 fn clean_input_path(input: &str) -> String {
     let mut s = input.trim();
@@ -177,25 +181,63 @@ fn find_all_installs() -> Vec<PathBuf> {
     installs
 }
 
-fn process_install(install: &Path) -> Result<String, String> {
-    // Kill any running Antigravity processes to avoid file locks during patching.
-    for proc_name in &["antigravity", "language_server", "agy"] {
-        Command::new("taskkill")
-            .args(&["/F", "/IM", &format!("{}.exe", proc_name)])
-            .output()
-            .ok();
-    }
-    thread::sleep(Duration::from_millis(1000));
+/// Puts a v2.4+ install back into its pristine shape: the extracted
+/// `resources/app` from an older patch is removed and `app.asar` is restored.
+/// Electron prefers `resources/app` over the archive, so the directory must be
+/// gone before the archive is put back.
+fn restore_pristine_asar(resources: &Path) -> Result<(), String> {
+    let app_dir = resources.join("app");
+    let app_asar = resources.join("app.asar");
+    let asar_bak = resources.join("app.asar.bak");
 
-    // Patch all relevant binaries (Language Server / CLI)
-    patch_all_binaries(install);
+    // Only touch resources/app when it demonstrably came from an archive.
+    // Antigravity IDE ships resources/app as its real, unpacked layout - with
+    // neither app.asar nor a backup present there is nothing to restore, and
+    // deleting the directory would destroy the install.
+    if !asar_bak.exists() && !app_asar.exists() {
+        return Ok(());
+    }
+
+    if app_dir.exists() {
+        fs::remove_dir_all(&app_dir)
+            .map_err(|e| format!("не удалось удалить resources\\app: {}", e))?;
+    }
+    if asar_bak.exists() && !app_asar.exists() {
+        fs::rename(&asar_bak, &app_asar)
+            .map_err(|e| format!("не удалось восстановить app.asar: {}", e))?;
+    }
+    Ok(())
+}
+
+fn process_install(install: &Path) -> Result<String, String> {
+    // Patch all relevant binaries (Language Server / CLI).
+    let bin_summary = patch_all_binaries(install);
 
     let resources = install.join("resources");
     let app_dir = resources.join("app");
     let app_asar = resources.join("app.asar");
 
     if app_asar.exists() {
-        // Always re-extract to avoid stale files from a previous patch run.
+        // Peek at dist/main.js straight out of the archive. On v2.4+ the shell
+        // carries no auth code, so nothing is unpacked and the install stays
+        // byte-identical to a fresh one.
+        let is_new_arch = asar::read_asar_entry(&app_asar, "dist/main.js")
+            .and_then(|b| String::from_utf8(b).ok())
+            .map_or(false, |src| is_new_desktop_architecture(&src));
+
+        if is_new_arch {
+            // Clean up leftovers from a patch applied before v2.4.
+            restore_pristine_asar(&resources)?;
+            println!("  [INFO] v2.4+ архитектура — JS-патч не требуется (auth в Language Server)");
+            // The Language Server is the only thing being patched here, so if
+            // it did not take there is nothing to report as success.
+            if bin_summary.ok == 0 {
+                return Err(binary_failure_message(&bin_summary));
+            }
+            return Ok("Antigravity Desktop".to_string());
+        }
+
+        // Older layout: unpack so the JS can be patched.
         if app_dir.exists() {
             let _ = fs::remove_dir_all(&app_dir);
         }
@@ -216,19 +258,27 @@ fn process_install(install: &Path) -> Result<String, String> {
     } else if desktop_js.exists() {
         let js_patched = patch_desktop(install, &desktop_js)?;
         if !js_patched {
-            // v2.4+: JS-патч не нужен, восстанавливаем оригинальный app.asar
-            let _ = fs::remove_dir_all(&app_dir);
-            let asar_bak = resources.join("app.asar.bak");
-            if asar_bak.exists() {
-                let _ = fs::rename(&asar_bak, &app_asar);
-            }
+            // v2.4+ unpacked by an older build of this tool: undo the unpack.
+            restore_pristine_asar(&resources)?;
         }
         return Ok("Antigravity Desktop".to_string());
     } else if install.join("agy.exe").exists() {
+        if bin_summary.ok == 0 {
+            return Err(binary_failure_message(&bin_summary));
+        }
         return Ok("Antigravity CLI".to_string());
     }
 
     Err("Компоненты приложения не найдены".to_string())
+}
+
+fn binary_failure_message(summary: &patch_binary::BinarySummary) -> String {
+    if summary.total() == 0 {
+        "Бинарник Language Server / CLI не найден в этой установке".to_string()
+    } else {
+        "Сигнатура в Language Server не найдена — вероятно, вышла новая версия Antigravity"
+            .to_string()
+    }
 }
 
 fn is_gemini_cli_installed() -> bool {
@@ -252,6 +302,45 @@ fn handle_restore_dns() {
 
     println!("{}", "Готово!");
     thread::sleep(Duration::from_secs(2));
+}
+
+/// Full revert: undoes the binary patch, puts app.asar back and drops the DNS
+/// rules, so the machine returns to its pre-patch state without reinstalling.
+fn handle_revert_all() {
+    clear_screen();
+    println!("{}", APP_TITLE);
+    println!();
+    println!("Полный откат: снятие патча с бинарников, восстановление app.asar");
+    println!("и удаление NRPT-правил DNS.");
+    println!("------------------------------------------------------------");
+
+    kill_affected_processes();
+
+    let installs = find_all_installs();
+    if installs.is_empty() {
+        println!("Установки Antigravity не найдены.");
+    }
+
+    let mut reverted = Vec::new();
+    for inst in &installs {
+        println!("{}", "--------------------------------------------------");
+        println!("{} {}", "Обработка:", mask_path(&inst.display().to_string()));
+        let n = unpatch_all_binaries(inst);
+        if let Err(e) = restore_pristine_asar(&inst.join("resources")) {
+            println!("  \x1b[33m[ERR] {}\x1b[0m\x1b[92m", e);
+        }
+        if n > 0 {
+            reverted.push(mask_path(&inst.display().to_string()));
+        }
+    }
+
+    println!("{}", "--------------------------------------------------");
+    print!("Удаление NRPT-правил DNS... ");
+    io::stdout().flush().ok();
+    remove_dns_nrpt();
+    println!("готово.");
+
+    print_results(&reverted, &[]);
 }
 
 fn is_valid_gemini_api_key(key: &str) -> bool {
@@ -433,21 +522,25 @@ fn handle_patch_gemini() {
 
     let mut api_key = String::new();
 
-    if is_admin() && !is_nrpt_applied() {
+    // The Gemini flow points the user at the AI Studio key page, so that host
+    // is routed too.
+    if is_admin() {
         print!("\nПатч для Google серверов... ");
         io::stdout().flush().ok();
-        match setup_dns_nrpt() {
+        match setup_dns_nrpt_with(true) {
             Ok(_) => println!("OK"),
             Err(_) => println!("пропущено"),
         }
     }
 
     let existing_key = get_system_gemini_api_key();
+    const API_KEYS_URL: &str = "https://aistudio.google.com/app/u/1/api-keys";
 
     println!("\n============================================================");
     println!("Gemini CLI (forbidden necromancy)");
     println!("Требуется: AIzaSy-ключ из");
-    println!("  {}", link("https://aistudio.google.com/app/u/1/api-keys", "aistudio.google.com/app/u/1/api-keys"));
+    println!("  {}", link(API_KEYS_URL, "aistudio.google.com/app/u/1/api-keys"));
+    println!("  {}", open_hint("open"));
     println!();
 
     if let Some(ref ext_key) = existing_key {
@@ -471,6 +564,12 @@ fn handle_patch_gemini() {
 
         print!("\x1b[1A\x1b[2K");
         io::stdout().flush().unwrap();
+
+        if key_input.eq_ignore_ascii_case("open") || key_input.eq_ignore_ascii_case("o") {
+            open_url(API_KEYS_URL);
+            println!("> (страница открыта в браузере)");
+            continue;
+        }
 
         if key_input.is_empty() {
             if let Some(ref ext_key) = existing_key {
@@ -504,13 +603,15 @@ fn handle_patch_gemini() {
 
     let mut project_id = String::new();
     let existing_project = get_system_gcloud_project();
+    const PROJECT_URL: &str = "https://aistudio.google.com/app/apikey";
 
     println!("\n============================================================");
     println!("Google Cloud Project ID (Идентификатор проекта)");
     println!("Требуется для работы OAuth (авторизации через браузер).");
     println!("Вы можете получить его из:");
-    println!("  {}", link("https://aistudio.google.com/app/apikey", "aistudio.google.com/app/apikey"));
+    println!("  {}", link(PROJECT_URL, "aistudio.google.com/app/apikey"));
     println!("  (кликните на имя проекта или шестеренку у вашего ключа)");
+    println!("  {}", open_hint("open"));
     println!();
 
     if let Some(ref ext_proj) = existing_project {
@@ -533,6 +634,12 @@ fn handle_patch_gemini() {
 
         print!("\x1b[1A\x1b[2K");
         io::stdout().flush().unwrap();
+
+        if proj_input.eq_ignore_ascii_case("open") || proj_input.eq_ignore_ascii_case("o") {
+            open_url(PROJECT_URL);
+            println!("> (страница открыта в браузере)");
+            continue;
+        }
 
         if proj_input.is_empty() {
             if let Some(ref ext_proj) = existing_project {
@@ -711,28 +818,26 @@ fn main() {
         println!("1. Разблокировать Antigravity / Antigravity IDE / Antigravity CLI");
         println!("2. Разблокировать Gemini CLI (deprecated)");
         println!("3. Отменить NRPT-патч (отключит исправление ошибок \"400\")");
-        println!("4. Открыть Telegram-группу ({})", link("https://t.me/nova_txt", "https://t.me/nova_txt"));
-        println!("5. Поблагодарить автора ({})", link("https://nova-app.eu/donate", "https://nova-app.eu/donate"));
+        println!("4. Открыть Telegram-группу ({})", link(TELEGRAM_URL, TELEGRAM_URL));
+        println!("5. Поблагодарить автора ({})", link(DONATE_URL, DONATE_URL));
         println!("6. Указать путь к Antigravity вручную");
+        println!("7. Полный откат (снять патч и вернуть исходное состояние)");
         println!("0. Выход");
         println!();
+        println!("Пункты 4 и 5 открывают ссылку в браузере.");
         if !is_admin() && !is_nrpt_applied() {
             println!("Запущено без админ-прав: серверный патч будет пропущен.");
-            println!();
         }
-        print!("> ");
-        io::stdout().flush().unwrap();
+        println!();
 
-        let mut choice = String::new();
-        io::stdin().read_line(&mut choice).unwrap();
-
-        match choice.trim() {
+        match prompt("> ").as_str() {
             "1" => handle_patch_antigravity(),
             "2" => handle_patch_gemini(),
             "3" => handle_restore_dns(),
-            "4" => open_url("https://t.me/nova_txt"),
-            "5" => open_url("https://nova-app.eu/donate"),
+            "4" => open_url(TELEGRAM_URL),
+            "5" => open_url(DONATE_URL),
             "6" => handle_manual_path(),
+            "7" => handle_revert_all(),
             "0" => break,
             _ => {
                 println!("{}", "Неверный выбор.");

@@ -59,7 +59,9 @@ pub fn patch_ide(_inst: &Path, main_js: &Path) -> Result<(), String> {
 }
 
 /// v2.4+ Desktop: modular Electron shell, auth lives in Language Server binary.
-fn is_new_desktop_architecture(content: &str) -> bool {
+/// Verified against 2.4.2 and 2.5.0 - `dist/main.js` only wires up the shell
+/// (`./languageServer`, `./ipcHandlers`) and carries no auth/eligibility code.
+pub fn is_new_desktop_architecture(content: &str) -> bool {
     let modular = content.contains("./languageServer")
         && content.contains("./ipcHandlers");
     let legacy_auth = content.contains("_handleAuthErrorResponse")
@@ -313,6 +315,44 @@ fn apply_desktop_inline_patches(content: &str) -> String {
     }).to_string();
 
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+
+    #[test]
+    fn recognises_the_shipping_v24_plus_shell() {
+        let Ok(local) = env::var("LOCALAPPDATA") else { return };
+        let asar = Path::new(&local)
+            .join("Programs")
+            .join("Antigravity")
+            .join("resources")
+            .join("app.asar");
+        if !asar.exists() {
+            return;
+        }
+        let src = crate::asar::read_asar_entry(&asar, "dist/main.js")
+            .and_then(|b| String::from_utf8(b).ok())
+            .expect("dist/main.js");
+        assert!(
+            is_new_desktop_architecture(&src),
+            "installed Desktop build was classified as legacy - the JS patch would be applied"
+        );
+    }
+
+    #[test]
+    fn a_legacy_shell_still_needs_the_js_patch() {
+        let legacy = r#"require("./languageServer");require("./ipcHandlers");
+            _handleAuthErrorResponse(e){var t=e?.failureDetails;}"#;
+        assert!(!is_new_desktop_architecture(legacy));
+    }
+
+    #[test]
+    fn a_non_modular_shell_is_not_v24() {
+        assert!(!is_new_desktop_architecture("const x = 1;"));
+    }
 }
 
 pub fn patch_extension_js(inst: &Path) -> Result<bool, String> {

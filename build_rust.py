@@ -1,7 +1,5 @@
 import os
-import random
 import re
-import string
 import subprocess
 import sys
 import time
@@ -11,57 +9,54 @@ if hasattr(sys.stdout, 'reconfigure'):
 if hasattr(sys.stderr, 'reconfigure'):
     sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
+# Must match src\auth.rs (LICENSE_VERSION_SEP): the license key is derived from
+# base_secret + SEP + version, so keys are unique per release.
+LICENSE_VERSION_SEP = "::"
 
-def generate_secret(length=32):
-    chars = string.ascii_letters + string.digits
-    return ''.join(random.choices(chars, k=length))
 
+def read_base_secret(auth_rs_path):
+    """Reads the committed base secret straight from src\\auth.rs, so the source
+    is the single source of truth for both the binary and the key generator."""
+    with open(auth_rs_path, 'r', encoding='utf-8') as f:
+        src = f.read()
+    m = re.search(r'const\s+LICENSE_BASE_SECRET\s*:\s*&str\s*=\s*"([^"]*)"', src)
+    if not m:
+        raise RuntimeError("LICENSE_BASE_SECRET not found in src/auth.rs")
+    return m.group(1)
 
-def replace_in_file(filepath, old_str, new_str):
-    with open(filepath, 'r', encoding='utf-8') as f:
-        content = f.read()
-    content = content.replace(old_str, new_str)
-    with open(filepath, 'w', encoding='utf-8') as f:
-        f.write(content)
 
 def main():
     # Set correct working directory to where this script is located
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     print("[INFO] Starting build process...")
 
-    VERSION = "2.4.2"
+    VERSION = "2.5.0"
     version = VERSION
+    # env!("CARGO_PKG_VERSION") only sees MAJOR.MINOR.PATCH, so the key salt uses
+    # the same trimmed value the binary will compile with.
+    cargo_version = ".".join(version.split(".")[:3])
     print(f"[INFO] Build version: {version}")
 
-    # 1. Load or generate secrets
-    secrets_path = ".secrets.json"
-    is_owner = os.path.exists(secrets_path)
-    license_secret = ""
-    if is_owner:
-        try:
-            import json
-            with open(secrets_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                license_secret = data.get("license_secret", "")
-        except Exception as e:
-            print(f"[WARNING] Ошибка загрузки .secrets.json: {e}")
-            
-    if not license_secret:
-        license_secret = generate_secret(32)
+    # `.secrets.json` is now purely an owner marker: when present, this machine
+    # is the author's, so the key generator is produced and fresh keys printed.
+    # A clone from GitHub has no such file, so it builds a working binary but
+    # generates NO keys - users must fetch a free key from t.me/nova_txt.
+    is_owner = os.path.exists(".secrets.json")
 
     main_rs_path = r"src\main.rs"
     auth_rs_path = r"src\auth.rs"
-    
-    # 2. Inject secrets and version
-    replace_in_file(auth_rs_path, "___LICENSE_SECRET___", license_secret)
-    replace_in_file(main_rs_path, "___APP_VERSION___", version)
-    
+
+    # The secret is committed in the sources; the key generator derives from the
+    # exact same base + version salt, so its keys always match this build.
+    base_secret = read_base_secret(auth_rs_path)
+    key_secret_phrase = f"{base_secret}{LICENSE_VERSION_SEP}{cargo_version}"
+
     keygen_code = """import sys
 import os
 import subprocess
 import traceback
 
-SECRET_PHRASE = """ + repr(license_secret) + """
+SECRET_PHRASE = """ + repr(key_secret_phrase) + """
 
 def copy_to_clipboard(text):
     try:
@@ -297,26 +292,28 @@ if __name__ == "__main__":
     main()
 """
 
-    if is_owner:
-        dist_keygen_path = "dist_keygen.py"
-        with open(dist_keygen_path, 'w', encoding='utf-8') as f:
-            f.write(keygen_code)
-    
-    # 3. Sync version in Cargo.toml (strip to MAJOR.MINOR.PATCH for semver)
-    cargo_version = ".".join(version.split(".")[:3])
-    with open("Cargo.toml", 'r', encoding='utf-8') as f:
-        cargo_content = f.read()
-    cargo_content = re.sub(r'^version\s*=\s*"[^"]*"', f'version = "{cargo_version}"', cargo_content, flags=re.MULTILINE)
-    with open("Cargo.toml", 'w', encoding='utf-8') as f:
-        f.write(cargo_content)
+    dist_keygen_path = "dist_keygen.py"
 
-    # 4. Build Rust project
-    print("[INFO] Запуск компиляции (Release mode)...")
-    
-    cargo_cmd = ["cargo", "build", "--release"]
     try:
-        subprocess.check_call(cargo_cmd)
-        
+        # 1. Sync the version in Cargo.toml so env!("CARGO_PKG_VERSION") - which
+        #    both the binary and the key salt use - matches this release.
+        with open("Cargo.toml", 'r', encoding='utf-8') as f:
+            cargo_content = f.read()
+        cargo_content = re.sub(r'^version\s*=\s*"[^"]*"', f'version = "{cargo_version}"', cargo_content, flags=re.MULTILINE)
+        with open("Cargo.toml", 'w', encoding='utf-8') as f:
+            f.write(cargo_content)
+
+        # 2. Owner-only: (re)generate the key generator for THIS version. Never
+        #    created on a plain clone from GitHub - those builds ship no keys.
+        if is_owner:
+            with open(dist_keygen_path, 'w', encoding='utf-8') as f:
+                f.write(keygen_code)
+
+        # 3. Build the release binary (only the main target). No source edits are
+        #    made, so there is nothing sensitive that could be left behind.
+        print("[INFO] Запуск компиляции (Release mode)...")
+        subprocess.check_call(["cargo", "build", "--release", "--bin", "ag_unlocker"])
+
         import shutil
         os.makedirs("release", exist_ok=True)
         out_path = os.path.abspath(os.path.join("release", f"AG_{version}.exe"))
@@ -327,43 +324,40 @@ if __name__ == "__main__":
         if os.path.exists(out_path):
             os.remove(out_path)
         shutil.move(r"target\release\ag_unlocker.exe", out_path)
-        
-        # Compress with UPX if available
+
+        # Compress with UPX if available.
         print("[INFO] Сжатие исполняемого файла с помощью UPX...")
         try:
             subprocess.run(["upx", "--best", "--lzma", out_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             print("[INFO] Исполняемый файл успешно сжат с помощью UPX.")
         except Exception as e:
             print(f"[WARNING] Не удалось сжать файл с помощью UPX: {e}")
-        
+
         print("\n[УСПЕХ] Сборка завершена!")
         print(f"Ваш исполняемый файл: {out_path}")
-        
+
         if is_owner:
-            print(f"Ваш генератор ключей для этой сборки: {dist_keygen_path}")
-            print("\n[!] ОБЯЗАТЕЛЬНО сохраните сгенерированные сейчас ключи,")
-            print("так как при следующей сборке секреты будут изменены и старые ключи перестанут работать.")
-            # 4. Auto-generate some keys for convenience using python -c to avoid blocking
-            print("\nВот 5 ключей для текущей сборки:")
+            print(f"Ваш генератор ключей для этой версии: {dist_keygen_path}")
+            print(f"\n[i] Ключи привязаны к версии {cargo_version}: на следующем релизе")
+            print("    (после смены VERSION здесь) они перестанут подходить, и людям")
+            print("    понадобится новый ключ из t.me/nova_txt.")
+            # Auto-generate some keys for convenience.
+            print(f"\n5 ключей для версии {cargo_version}:")
             subprocess.check_call(["python", "-c", "import dist_keygen; [print(dist_keygen.generate_key()) for _ in range(5)]"])
         else:
-            print("\n[INFO] Файл .secrets.json не найден. Сборка выполнена с временным секретом. Генератор ключей dist_keygen.py не создан.")
-        
+            print("\nДля работы необходим ключ - получить его можно бесплатно в группе t.me/nova_txt")
+
     except subprocess.CalledProcessError as e:
         print(f"\n[ОШИБКА] Сборка завершилась с ошибкой: {e}")
+    except Exception as e:
+        print(f"\n[ОШИБКА] Непредвиденная ошибка сборки: {e}")
     finally:
-        # 5. Revert secrets and version to placeholders so they don't stay in source code
-        replace_in_file(auth_rs_path, license_secret, "___LICENSE_SECRET___")
-        replace_in_file(main_rs_path, version, "___APP_VERSION___")
-
-        # 6. Clean target folder to save space and keep repository clean
-        print("[INFO] Очистка временных файлов сборки (cargo clean)...")
+        # Clean the target folder to save space and keep the repo clean.
+        print("\n[INFO] Очистка временных файлов сборки (cargo clean)...")
         try:
             subprocess.run(["cargo", "clean"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
             pass
-        
-        print("\n[INFO] Исходный код очищен от секретов.")
 
 if __name__ == "__main__":
     main()

@@ -1,6 +1,6 @@
 [package]
 name = "ag_unlocker"
-version = "2.4.2"
+version = "2.5.0"
 edition = "2021"
 description = "Antigravity Configuration Tool"
 authors = ["Brent t.me/nova_txt"]

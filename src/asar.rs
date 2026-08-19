@@ -59,7 +59,8 @@ pub fn read_asar_entry(app_asar: &Path, rel_path: &str) -> Option<Vec<u8>> {
         .and_then(|o| o.as_str())
         .and_then(|o| o.parse::<u64>().ok())?;
 
-    file.seek(SeekFrom::Start(header.base_offset + offset)).ok()?;
+    file.seek(SeekFrom::Start(header.base_offset + offset))
+        .ok()?;
     let mut buf = vec![0u8; size as usize];
     file.read_exact(&mut buf).ok()?;
     Some(buf)
@@ -84,7 +85,10 @@ fn extract_entry(
     let size = entry.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
     let offset_str = entry.get("offset").and_then(|o| o.as_str()).unwrap_or("0");
     let offset = offset_str.parse::<u64>().unwrap_or(0);
-    let unpacked = entry.get("unpacked").and_then(|u| u.as_bool()).unwrap_or(false);
+    let unpacked = entry
+        .get("unpacked")
+        .and_then(|u| u.as_bool())
+        .unwrap_or(false);
 
     if let Some(parent) = current_path.parent() {
         fs::create_dir_all(parent)?;

@@ -8,9 +8,14 @@ use std::time::Duration;
 
 mod asar;
 mod auth;
+mod background;
 mod canary;
 mod console_style;
 mod dns;
+mod dns_client;
+mod dns_forwarder;
+mod egress;
+mod hosts_pin;
 mod patch_binary;
 mod patch_gemini;
 mod patch_ide;
@@ -18,7 +23,7 @@ mod utils;
 
 use asar::extract_asar;
 use auth::login_screen;
-use dns::{is_nrpt_applied, remove_dns_nrpt, setup_dns_nrpt, setup_dns_nrpt_with};
+use dns::{is_nrpt_applied, refresh_pinned_hosts, remove_dns_nrpt, setup_dns_nrpt_with};
 use patch_binary::{kill_affected_processes, patch_all_binaries, unpatch_all_binaries};
 use patch_gemini::run_gemini_patcher;
 use patch_ide::{is_new_desktop_architecture, patch_desktop, patch_extension_js, patch_ide};
@@ -299,7 +304,41 @@ fn is_gemini_cli_installed() -> bool {
     }
 }
 
+/// Starts the background resolver and installs the NRPT rules. Order matters:
+/// the nameserver the rules point at depends on whether the relay is running,
+/// so it has to be up before they are written.
+fn apply_dns_patch(include_gemini: bool) {
+    print!("\nФоновый DNS-резолвер... ");
+    io::stdout().flush().ok();
+    match background::ensure_running() {
+        Ok(_) => println!("OK"),
+        // Not fatal: the rules below fall back to the direct resolvers.
+        Err(e) => println!("\x1b[33mпропущено ({})\x1b[0m\x1b[92m", e),
+    }
+
+    print!("Патч для Google серверов... ");
+    io::stdout().flush().ok();
+    match setup_dns_nrpt_with(include_gemini) {
+        Ok(outcome) => {
+            println!("OK");
+            if let Some(note) = dns::outcome_note(&outcome) {
+                println!("{}", note);
+            }
+        }
+        Err(_) => println!("пропущено"),
+    }
+}
+
+/// Menu 6: undoes the DNS half of the patch and nothing else, so the binaries
+/// stay patched.
 fn handle_restore_dns() {
+    print!("Удаление фоновой DNS-службы... ");
+    io::stdout().flush().ok();
+    match background::disable() {
+        Ok(_) => println!("готово."),
+        Err(e) => println!("\x1b[33mошибка: {}\x1b[0m\x1b[92m", e),
+    }
+
     print!("Удаление NRPT-правил DNS... ");
     io::stdout().flush().ok();
     remove_dns_nrpt();
@@ -315,8 +354,8 @@ fn handle_revert_all() {
     clear_screen();
     println!("{}", APP_TITLE);
     println!();
-    println!("Полный откат: снятие патча с бинарников, восстановление app.asar");
-    println!("и удаление NRPT-правил DNS.");
+    println!("Полный откат: снятие патча с бинарников, восстановление app.asar,");
+    println!("удаление фоновой DNS-службы и NRPT-правил.");
     println!("------------------------------------------------------------");
 
     kill_affected_processes();
@@ -344,6 +383,13 @@ fn handle_revert_all() {
     }
 
     println!("{}", "--------------------------------------------------");
+    print!("Удаление фоновой DNS-службы... ");
+    io::stdout().flush().ok();
+    match background::disable() {
+        Ok(_) => println!("готово."),
+        Err(e) => println!("\x1b[33mошибка: {}\x1b[0m\x1b[92m", e),
+    }
+
     print!("Удаление NRPT-правил DNS... ");
     io::stdout().flush().ok();
     remove_dns_nrpt();
@@ -520,14 +566,9 @@ fn handle_patch_antigravity() {
     }
 
     if (!successes.is_empty() || !failures.is_empty()) && is_admin() {
-        if !is_nrpt_applied() {
-            print!("\nПатч для Google серверов... ");
-            io::stdout().flush().ok();
-            match setup_dns_nrpt() {
-                Ok(_) => println!("OK"),
-                Err(_) => println!("пропущено"),
-            }
-        }
+        // Unconditionally, not only on a fresh machine: this run has to bring the
+        // relay up and re-point the rules at it even when the rules already exist.
+        apply_dns_patch(false);
     }
 
     print_results(&successes, &failures);
@@ -551,12 +592,7 @@ fn handle_patch_gemini() {
     // The Gemini flow points the user at the AI Studio key page, so that host
     // is routed too.
     if is_admin() {
-        print!("\nПатч для Google серверов... ");
-        io::stdout().flush().ok();
-        match setup_dns_nrpt_with(true) {
-            Ok(_) => println!("OK"),
-            Err(_) => println!("пропущено"),
-        }
+        apply_dns_patch(true);
     }
 
     let existing_key = get_system_gemini_api_key();
@@ -822,14 +858,9 @@ fn handle_manual_path() {
     }
 
     if (!successes.is_empty() || !failures.is_empty()) && is_admin() {
-        if !is_nrpt_applied() {
-            print!("\nПатч для Google серверов... ");
-            io::stdout().flush().ok();
-            match setup_dns_nrpt() {
-                Ok(_) => println!("OK"),
-                Err(_) => println!("пропущено"),
-            }
-        }
+        // Unconditionally, not only on a fresh machine: this run has to bring the
+        // relay up and re-point the rules at it even when the rules already exist.
+        apply_dns_patch(false);
     }
 
     print_results(&successes, &failures);
@@ -856,6 +887,19 @@ fn show_admin_prewarning() {
 }
 
 fn main() {
+    // The relay mode has to short-circuit before anything draws or prompts: the
+    // scheduled task starts this exe with no console and no user behind it.
+    if env::args().any(|a| a == background::FORWARDER_FLAG) {
+        // Before anything else: the task launches a console subsystem exe, and
+        // the window it gets would otherwise sit on screen for the whole run.
+        dns_forwarder::detach_console();
+        if let Err(e) = dns_forwarder::run() {
+            dns_forwarder::log_fatal(&e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
     // `--about` / `--license` / `--version`: prints the copyright notice and the
     // build canaries, then exits. Deliberately before the key prompt so any
     // binary can be fingerprinted without a licence key.
@@ -871,6 +915,12 @@ fn main() {
 
     login_screen();
 
+    // The NRPT rules survive a reboot; the host routes that keep their queries
+    // off the VPN only survive it while the network stays the same.
+    if is_admin() {
+        refresh_pinned_hosts();
+    }
+
     loop {
         clear_screen();
         // Users only need the product name and version here; the build canary is
@@ -879,16 +929,21 @@ fn main() {
         // canary::CANARY_ANCHOR, so dropping this reference cannot strip it.
         println!("{} v{}", APP_TITLE, APP_VERSION);
         println!();
-        println!("1. Разблокировать Antigravity / Antigravity IDE / Antigravity CLI");
+        println!("1. Разблокировать Antigravity 2.0 / IDE / CLI");
         println!("2. Разблокировать Gemini CLI (deprecated)");
-        println!("3. Отменить NRPT-патч (отключит исправление ошибок \"400\")");
+        println!("3. Указать путь к Antigravity вручную");
         println!(
             "4. Открыть Telegram-группу ({})",
             link(TELEGRAM_URL, TELEGRAM_URL)
         );
-        println!("5. Поблагодарить автора ({})", link(DONATE_URL, DONATE_URL));
-        println!("6. Указать путь к Antigravity вручную");
-        println!("7. Полный откат (снять патч и вернуть исходное состояние)");
+        println!(
+            "5. Отблагодарить копеечкой ({})",
+            link(DONATE_URL, DONATE_URL)
+        );
+        // Yellow-green (256-color 154) for the two "undo" actions; reset then
+        // restore the menu's bright-green afterwards.
+        println!("\x1b[38;5;154m6. Отключить DNS-службу и NRPT (отключит исправление ошибок \"400\")\x1b[0m\x1b[92m");
+        println!("\x1b[38;5;154m7. Полный откат (снять патч и вернуть исходное состояние)\x1b[0m\x1b[92m");
         println!("0. Выход");
         println!();
         println!("Пункты 4 и 5 открывают ссылку в браузере.");
@@ -900,10 +955,10 @@ fn main() {
         match prompt("> ").as_str() {
             "1" => handle_patch_antigravity(),
             "2" => handle_patch_gemini(),
-            "3" => handle_restore_dns(),
+            "3" => handle_manual_path(),
             "4" => open_url(TELEGRAM_URL),
             "5" => open_url(DONATE_URL),
-            "6" => handle_manual_path(),
+            "6" => handle_restore_dns(),
             "7" => handle_revert_all(),
             "0" => break,
             _ => {

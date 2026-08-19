@@ -1,7 +1,10 @@
-use std::os::raw::{c_long, c_ushort, c_ulong, c_uint, c_void};
+use std::os::raw::{c_long, c_uint, c_ulong, c_ushort, c_void};
 
 #[repr(C)]
-struct COORD { x: c_ushort, y: c_ushort }
+struct COORD {
+    x: c_ushort,
+    y: c_ushort,
+}
 
 #[repr(C)]
 struct CONSOLE_FONT_INFOEX {
@@ -30,7 +33,10 @@ const ENABLE_VIRTUAL_TERMINAL_PROCESSING: c_ulong = 0x0004;
 
 pub fn set(window_title: &str) {
     unsafe {
-        std::process::Command::new("cmd").args(["/C", "color 0A"]).status().ok();
+        std::process::Command::new("cmd")
+            .args(["/C", "color 0A"])
+            .status()
+            .ok();
         let handle = GetStdHandle(STD_OUTPUT_HANDLE);
         // Enable VT processing so ANSI escapes (incl. OSC 8 hyperlinks) work in conhost.
         let mut mode: c_ulong = 0;

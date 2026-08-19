@@ -1,4 +1,4 @@
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use std::io::{self, Write};
 use std::thread;
 use std::time::Duration;
@@ -101,11 +101,7 @@ pub fn login_screen() {
         crate::utils::clear_screen();
         println!("{}", "=== ПРОВЕРКА ДОСТУПА ===");
         println!();
-        println!(
-            "Бесплатный ключ для версии {} — в группе t.me/nova_txt",
-            env!("CARGO_PKG_VERSION")
-        );
-        println!("(ключ действует только для этой версии; после обновления возьмите новый)");
+        println!("Бесплатный ключ можно взять в группе t.me/nova_txt в комнате \"Antigravity\", для каждой версии анлокера ключи разные");
         println!();
         print!("{}", "Введите лицензионный ключ: ");
         io::stdout().flush().unwrap();

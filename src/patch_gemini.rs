@@ -5,7 +5,7 @@ use std::process::Command;
 
 pub fn run_gemini_patcher() -> Result<(), String> {
     let appdata = env::var("APPDATA").map_err(|_| "APPDATA not defined")?;
-    
+
     let cli_dir = PathBuf::from(&appdata)
         .join("npm")
         .join("node_modules")
@@ -22,7 +22,8 @@ pub fn run_gemini_patcher() -> Result<(), String> {
                 let path = entry.path();
                 if path.extension().map_or(false, |ext| ext == "js") {
                     if let Ok(content) = fs::read_to_string(&path) {
-                        if content.contains("antigravity-vertex-api") || content.contains(r#"\"\""#) {
+                        if content.contains("antigravity-vertex-api") || content.contains(r#"\"\""#)
+                        {
                             needs_reinstall = true;
                             break;
                         }

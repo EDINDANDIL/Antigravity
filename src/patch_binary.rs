@@ -104,7 +104,9 @@ fn binary_targets(inst: &Path) -> Vec<PathBuf> {
         .join("bin");
     [
         inst.join("agy.exe"),
-        inst.join("resources").join("bin").join("language_server.exe"),
+        inst.join("resources")
+            .join("bin")
+            .join("language_server.exe"),
         ext_bin.join("language_server_windows_x64.exe"),
         ext_bin.join("language_server.exe"),
     ]
@@ -169,7 +171,11 @@ impl BinarySummary {
 pub fn patch_all_binaries(inst: &Path) -> BinarySummary {
     let mut summary = BinarySummary { ok: 0, failed: 0 };
     for bin in binary_targets(inst) {
-        let label = bin.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let label = bin
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
         match patch_binary(inst, &bin) {
             Ok(0) => {
                 println!("  [OK] {} — уже пропатчен", label);
@@ -222,7 +228,9 @@ mod tests {
     #[test]
     #[ignore]
     fn patches_and_reverts_the_installed_language_server() {
-        let Ok(local) = std::env::var("LOCALAPPDATA") else { return };
+        let Ok(local) = std::env::var("LOCALAPPDATA") else {
+            return;
+        };
         let src = Path::new(&local)
             .join("Programs")
             .join("Antigravity")
@@ -269,7 +277,11 @@ mod tests {
 pub fn unpatch_all_binaries(inst: &Path) -> usize {
     let mut reverted = 0;
     for bin in binary_targets(inst) {
-        let label = bin.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let label = bin
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
         match unpatch_binary(&bin) {
             Ok(0) => println!("  [--] {} — патч не найден", label),
             Ok(n) => {

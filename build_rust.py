@@ -161,7 +161,7 @@ def main():
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     print("[INFO] Starting build process...")
 
-    VERSION = "2.8.1"
+    VERSION = "2.8.1.1"
     version = VERSION
     # env!("CARGO_PKG_VERSION") only sees MAJOR.MINOR.PATCH, so the key salt uses
     # the same trimmed value the binary will compile with.
@@ -465,8 +465,11 @@ if __name__ == "__main__":
 
         # Provenance record. Written after compression so the hash is of the file
         # that actually ships.
+        # Row keyed by the full shipped version (e.g. 2.8.1.1); the token is
+        # derived from cargo_version (2.8.1) to match the value baked into the
+        # binary, since a 4th version digit doesn't change the canary salt.
         token = release_token(cargo_version)
-        ledger = record_canary(cargo_version, token, out_path)
+        ledger = record_canary(version, token, out_path)
         print(f"\n[i] Канарейка релиза: {token}")
         print(f"    Записано в {ledger}. Проверить любой файл/бинарник:")
         print(f"    python tools\\canary_check.py <путь>")

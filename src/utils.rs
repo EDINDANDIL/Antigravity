@@ -2,6 +2,15 @@ use std::env;
 use std::io::{self, Write};
 use std::process::Command;
 
+/// Runs a PowerShell snippet and hands back the raw output. Shared by the DNS
+/// and routing code, which is all cmdlet-driven.
+pub fn powershell(script: &str) -> Option<std::process::Output> {
+    Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output()
+        .ok()
+}
+
 pub fn clear_screen() {
     // VT is enabled at startup, so the escape sequence works everywhere and
     // avoids spawning a cmd.exe just to clear the screen.
@@ -22,7 +31,10 @@ pub fn supports_hyperlinks() -> bool {
 // real hyperlink (Ctrl+Click); elsewhere it stays a readable, selectable URL.
 pub fn link(url: &str, text: &str) -> String {
     if supports_hyperlinks() {
-        format!("\x1b[94;4m\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\\x1b[0m\x1b[92m", url, text)
+        format!(
+            "\x1b[94;4m\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\\x1b[0m\x1b[92m",
+            url, text
+        )
     } else {
         format!("\x1b[94;4m{}\x1b[0m\x1b[92m", text)
     }
@@ -32,7 +44,10 @@ pub fn link(url: &str, text: &str) -> String {
 pub fn open_url(url: &str) {
     #[cfg(target_os = "windows")]
     {
-        Command::new("cmd").args(["/C", "start", "", url]).status().ok();
+        Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .status()
+            .ok();
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -52,7 +67,10 @@ pub fn prompt(label: &str) -> String {
 /// Hint shown next to any printed link, telling the user how to follow it.
 pub fn open_hint(keyword: &str) -> String {
     if supports_hyperlinks() {
-        format!("(Ctrl+клик по ссылке, либо введите '{}' чтобы открыть в браузере)", keyword)
+        format!(
+            "(Ctrl+клик по ссылке, либо введите '{}' чтобы открыть в браузере)",
+            keyword
+        )
     } else {
         format!("(введите '{}' чтобы открыть в браузере)", keyword)
     }
@@ -82,10 +100,15 @@ pub fn is_admin() -> bool {
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn is_admin() -> bool { false }
+pub fn is_admin() -> bool {
+    false
+}
 
 pub fn print_results(successes: &[String], failures: &[String]) {
-    println!("\n{}", "============================================================");
+    println!(
+        "\n{}",
+        "============================================================"
+    );
     println!("{}", "ИТОГИ:");
     if !successes.is_empty() {
         println!("{}", "Успешно разблокированы:");
@@ -99,7 +122,10 @@ pub fn print_results(successes: &[String], failures: &[String]) {
             println!("  \x1b[33m[-] {}\x1b[0m\x1b[92m", f);
         }
     }
-    println!("{}", "============================================================");
+    println!(
+        "{}",
+        "============================================================"
+    );
     println!("{}", "Чтобы вернуться в главное меню, нажмите Enter");
     let mut wait = String::new();
     io::stdin().read_line(&mut wait).unwrap();

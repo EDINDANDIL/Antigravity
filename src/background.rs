@@ -1,10 +1,10 @@
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::dns_forwarder;
-use crate::utils::powershell;
+use crate::utils::{no_window, powershell};
 
 // Keeping the DNS relay alive across reboots.
 //
@@ -52,19 +52,17 @@ pub fn is_enabled() -> bool {
 }
 
 pub fn is_running() -> bool {
-    Command::new("tasklist")
-        .args(["/FI", &format!("IMAGENAME eq {}", EXE_NAME), "/NH"])
-        .output()
-        .map_or(false, |o| {
-            String::from_utf8_lossy(&o.stdout).contains(EXE_NAME)
-        })
+    let mut cmd = Command::new("tasklist");
+    cmd.args(["/FI", &format!("IMAGENAME eq {}", EXE_NAME), "/NH"]);
+    no_window(&mut cmd).output().map_or(false, |o| {
+        String::from_utf8_lossy(&o.stdout).contains(EXE_NAME)
+    })
 }
 
 fn stop_process() {
-    Command::new("taskkill")
-        .args(["/F", "/IM", EXE_NAME])
-        .output()
-        .ok();
+    let mut cmd = Command::new("taskkill");
+    cmd.args(["/F", "/IM", EXE_NAME]);
+    no_window(&mut cmd).output().ok();
 }
 
 /// Copies this exe next to its log and registers the logon task. The copy is
@@ -109,10 +107,31 @@ pub fn enable() -> Result<(), String> {
     Ok(())
 }
 
-/// Enables the relay, or restarts it if the task exists but nothing is running.
-/// Cheap when it is already up, so the patch flow can call it every time.
+fn same_file_bytes(a: &Path, b: &Path) -> bool {
+    match (fs::read(a), fs::read(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// True when the installed relay is byte for byte this build.
+///
+/// Without this check an upgrade is a no-op: a task exists and a process is
+/// alive, so `ensure_running` would leave the *previous* exe installed. That is
+/// how a build that fixes a background bug would keep reproducing it - the
+/// running relay is still the old one.
+fn installed_copy_is_current() -> bool {
+    match env::current_exe() {
+        Ok(src) => same_file_bytes(&src, &installed_exe()),
+        Err(_) => false,
+    }
+}
+
+/// Brings the relay up, reinstalling it whenever the installed copy is not this
+/// build. Cheap when everything is already current, so the patch flow can call
+/// it every time.
 pub fn ensure_running() -> Result<(), String> {
-    if is_enabled() && is_running() {
+    if is_enabled() && is_running() && installed_copy_is_current() {
         return Ok(());
     }
     enable()
@@ -155,6 +174,29 @@ mod tests {
                 "the task would refuse to start it"
             );
         }
+    }
+
+    /// The upgrade path depends on spotting a stale installed copy.
+    #[test]
+    fn a_differing_installed_copy_is_detected() {
+        let dir = env::temp_dir().join("ag_relay_copy_test");
+        fs::create_dir_all(&dir).expect("temp dir");
+        let (a, b) = (dir.join("a.bin"), dir.join("b.bin"));
+
+        fs::write(&a, b"build-one").unwrap();
+        fs::write(&b, b"build-one").unwrap();
+        assert!(
+            same_file_bytes(&a, &b),
+            "identical files must compare equal"
+        );
+
+        fs::write(&b, b"build-two").unwrap();
+        assert!(!same_file_bytes(&a, &b), "a new build must be spotted");
+
+        // A missing installation counts as "not current", so it gets installed.
+        assert!(!same_file_bytes(&a, &dir.join("nothing-here.bin")));
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     /// The log goes the other way round - the relay runs unelevated and cannot

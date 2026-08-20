@@ -2,13 +2,33 @@ use std::env;
 use std::io::{self, Write};
 use std::process::Command;
 
+/// Suppresses the console Windows would otherwise create for a console
+/// subsystem child.
+///
+/// This matters because the DNS relay calls `FreeConsole()` and so has no
+/// console of its own: every helper it spawns gets a brand new one, which is a
+/// black window flashing on the user's screen (measured - the `conhost.exe`
+/// count goes up by one per spawn). Output is read through pipes, so nothing
+/// needs a window. Not applied to the `color` call in `console_style`, which
+/// deliberately acts on the console it is attached to.
+#[cfg(target_os = "windows")]
+pub fn no_window(cmd: &mut Command) -> &mut Command {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn no_window(cmd: &mut Command) -> &mut Command {
+    cmd
+}
+
 /// Runs a PowerShell snippet and hands back the raw output. Shared by the DNS
 /// and routing code, which is all cmdlet-driven.
 pub fn powershell(script: &str) -> Option<std::process::Output> {
-    Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .output()
-        .ok()
+    let mut cmd = Command::new("powershell");
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+    no_window(&mut cmd).output().ok()
 }
 
 pub fn clear_screen() {
@@ -102,6 +122,50 @@ pub fn is_admin() -> bool {
 #[cfg(not(target_os = "windows"))]
 pub fn is_admin() -> bool {
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reproduces the relay's situation - a process with no console of its own -
+    /// and checks what a spawned helper gets.
+    ///
+    /// Counting `conhost.exe` is not the measurement to make here:
+    /// `CREATE_NO_WINDOW` still gives the child a console, it just never shows
+    /// it. So this asks the child directly whether its console window is
+    /// visible. Detaches the console of the test process, so run it alone.
+    #[test]
+    #[ignore = "detaches the console and spawns processes; run alone with --ignored"]
+    fn a_helper_spawned_without_a_console_shows_no_window() {
+        const SCRIPT: &str = "Add-Type -Name W -Namespace N -MemberDefinition '\
+            [DllImport(\"kernel32.dll\")] public static extern System.IntPtr GetConsoleWindow();\
+            [DllImport(\"user32.dll\")] public static extern bool IsWindowVisible(System.IntPtr h);'; \
+            $h=[N.W]::GetConsoleWindow(); \
+            if ($h -eq [System.IntPtr]::Zero) { 'no-console' } \
+            elseif ([N.W]::IsWindowVisible($h)) { 'VISIBLE' } else { 'hidden' }";
+
+        let ask = |flagged: bool| -> String {
+            let mut cmd = Command::new("powershell");
+            cmd.args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT]);
+            let out = if flagged {
+                no_window(&mut cmd).output()
+            } else {
+                cmd.output()
+            };
+            out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_else(|_| "spawn failed".to_string())
+        };
+
+        crate::dns_forwarder::detach_console();
+
+        let bare = ask(false);
+        let flagged = ask(true);
+        println!("without the flag: {}\nwith the flag:    {}", bare, flagged);
+
+        assert_eq!(bare, "VISIBLE", "the bug should reproduce without the flag");
+        assert_ne!(flagged, "VISIBLE", "CREATE_NO_WINDOW must hide the console");
+    }
 }
 
 pub fn print_results(successes: &[String], failures: &[String]) {

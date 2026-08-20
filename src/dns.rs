@@ -7,7 +7,7 @@ use crate::dns_client;
 use crate::dns_forwarder;
 use crate::egress::{self, Egress};
 use crate::hosts_pin;
-use crate::utils::powershell;
+use crate::utils::{no_window, powershell};
 
 // NRPT-based selective DNS routing. Only the exact hostnames that Antigravity
 // actually talks to AND that the upstream resolver actually proxies are routed
@@ -91,18 +91,17 @@ fn lacks_global_ipv6() -> bool {
 }
 
 fn set_ipv4_precedence(precedence: &str) {
-    Command::new("netsh")
-        .args([
-            "interface",
-            "ipv6",
-            "set",
-            "prefixpolicy",
-            IPV4_PREFIX,
-            precedence,
-            "4",
-        ])
-        .output()
-        .ok();
+    let mut cmd = Command::new("netsh");
+    cmd.args([
+        "interface",
+        "ipv6",
+        "set",
+        "prefixpolicy",
+        IPV4_PREFIX,
+        precedence,
+        "4",
+    ]);
+    no_window(&mut cmd).output().ok();
 }
 
 /// Restores the default IPv4/IPv6 precedence, but only if the current value is

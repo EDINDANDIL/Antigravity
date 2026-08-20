@@ -55,13 +55,19 @@ pub fn detach_console() {
 pub fn detach_console() {}
 
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(4);
-/// How long a detected interface is trusted. Detection shells out to
-/// PowerShell, so it is cached; the lookup is lazy, so an idle machine spawns
-/// nothing at all.
-const EGRESS_TTL: Duration = Duration::from_secs(300);
+/// How long a *detected* interface is trusted. Long on purpose: detection
+/// shells out to PowerShell, and an interface that dies is caught by
+/// `invalidate_interface()` on the first failed relay, so re-probing on a timer
+/// buys nothing and only spawns processes on the user's machine.
+const EGRESS_TTL: Duration = Duration::from_secs(30 * 60);
+/// How long a *failed* detection is remembered. Short, because it is usually
+/// the network not being up yet at logon - but not zero, or a machine with no
+/// physical egress at all would spawn a probe per query.
+const EGRESS_RETRY: Duration = Duration::from_secs(30);
 const LOG_LIMIT_BYTES: u64 = 64 * 1024;
 
-static EGRESS_CACHE: Mutex<Option<(u32, Instant)>> = Mutex::new(None);
+/// Interface index, when it was learned, and how long that answer is good for.
+static EGRESS_CACHE: Mutex<Option<(u32, Instant, Duration)>> = Mutex::new(None);
 
 /// The log lives under the user profile, not next to the exe: the relay runs
 /// unelevated, and the directory an administrator installed it into is not
@@ -103,17 +109,22 @@ fn invalidate_interface() {
 
 fn isp_interface() -> u32 {
     if let Ok(cache) = EGRESS_CACHE.lock() {
-        if let Some((idx, at)) = *cache {
-            if at.elapsed() < EGRESS_TTL {
+        if let Some((idx, at, good_for)) = *cache {
+            if at.elapsed() < good_for {
                 return idx;
             }
         }
     }
     // 0 means "use the routing table" - the right degradation when there is no
-    // physical egress to name.
-    let idx = egress::detect().map_or(0, |e| e.if_index);
+    // physical egress to name, but a poor thing to remember for long: at logon
+    // the network is often simply not up yet, and caching the miss would leave
+    // half an hour of unsubstituted answers.
+    let (idx, good_for) = match egress::detect() {
+        Some(eg) => (eg.if_index, EGRESS_TTL),
+        None => (0, EGRESS_RETRY),
+    };
     if let Ok(mut cache) = EGRESS_CACHE.lock() {
-        *cache = Some((idx, Instant::now()));
+        *cache = Some((idx, Instant::now(), good_for));
     }
     idx
 }
@@ -140,6 +151,11 @@ pub fn run() -> Result<(), String> {
     let sock = UdpSocket::bind((LISTEN_IP, LISTEN_PORT))
         .map_err(|e| format!("не удалось занять {}:{} — {}", LISTEN_IP, LISTEN_PORT, e))?;
     log(&format!("start: {}:{}", LISTEN_IP, LISTEN_PORT));
+    // Detect once up front. Otherwise the first query pays for a cold probe,
+    // which is long enough that Windows gives up on us and falls back to the
+    // direct resolvers - and then caches that unsubstituted answer for its full
+    // TTL, so one slow startup is felt for minutes.
+    log(&format!("egress: if{}", isp_interface()));
 
     let mut buf = [0u8; 4096];
     loop {
@@ -188,11 +204,37 @@ mod tests {
         invalidate_interface();
         assert!(EGRESS_CACHE.lock().unwrap().is_none());
         if let Ok(mut c) = EGRESS_CACHE.lock() {
-            *c = Some((17, Instant::now()));
+            *c = Some((17, Instant::now(), EGRESS_TTL));
         }
+        // Served from the cache: no detection runs, so no process is spawned.
         assert_eq!(isp_interface(), 17);
         invalidate_interface();
         assert!(EGRESS_CACHE.lock().unwrap().is_none());
+    }
+
+    /// An expired entry must not be served - that is what makes the short retry
+    /// after a failed detection actually retry.
+    #[test]
+    fn an_expired_entry_is_not_served() {
+        invalidate_interface();
+        if let Ok(mut c) = EGRESS_CACHE.lock() {
+            // Learned long ago, and only ever good for a moment.
+            *c = Some((17, Instant::now() - Duration::from_secs(60), EGRESS_RETRY));
+        }
+        let stale = EGRESS_CACHE
+            .lock()
+            .unwrap()
+            .map(|(_, at, good_for)| at.elapsed() >= good_for);
+        assert_eq!(stale, Some(true));
+        invalidate_interface();
+    }
+
+    /// A failed detection has to be forgotten quickly: at logon it usually just
+    /// means the network is not up yet.
+    #[test]
+    fn a_failed_detection_is_remembered_only_briefly() {
+        assert!(EGRESS_RETRY < EGRESS_TTL);
+        assert!(EGRESS_RETRY <= Duration::from_secs(60));
     }
 
     /// Relays a real query end to end through the running upstream. Needs a live

@@ -80,15 +80,29 @@ pub fn enable() -> Result<(), String> {
         fs::copy(&src, &dst).map_err(|e| format!("не скопировать exe: {}", e))?;
     }
 
+    // S4U is what keeps the logon silent. A task action run under the default
+    // Interactive principal is handed a *visible* console (measured), so the
+    // relay flashes a window on every logon during the moment before it can
+    // call FreeConsole. S4U runs it outside any interactive session - same
+    // user, no password stored, and the console it gets is hidden. It needs the
+    // "log on as a batch job" right, so a machine that refuses falls back to the
+    // old principal rather than ending up with no task at all.
     let cmd = format!(
-        "$ErrorActionPreference='Stop'; \
+        "Stop-ScheduledTask -TaskName '{task}' -ErrorAction SilentlyContinue; \
          $a=New-ScheduledTaskAction -Execute '{exe}' -Argument '{flag}'; \
          $t=New-ScheduledTaskTrigger -AtLogOn; \
          $s=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries \
               -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew \
               -ExecutionTimeLimit ([TimeSpan]::Zero); \
-         Register-ScheduledTask -TaskName '{task}' -Action $a -Trigger $t -Settings $s \
-              -Description 'Antigravity Unlocker: локальный DNS-релей' -Force | Out-Null; \
+         $d='Antigravity Unlocker: локальный DNS-релей'; \
+         try {{ \
+           $p=New-ScheduledTaskPrincipal -UserId \"$env:USERDOMAIN\\$env:USERNAME\" \
+                -LogonType S4U -RunLevel Limited; \
+           Register-ScheduledTask -TaskName '{task}' -Action $a -Trigger $t -Settings $s \
+                -Principal $p -Description $d -Force -ErrorAction Stop | Out-Null }} \
+         catch {{ \
+           Register-ScheduledTask -TaskName '{task}' -Action $a -Trigger $t -Settings $s \
+                -Description $d -Force -ErrorAction Stop | Out-Null }}; \
          Start-ScheduledTask -TaskName '{task}'",
         exe = dst.display(),
         flag = FORWARDER_FLAG,

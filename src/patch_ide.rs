@@ -2,6 +2,8 @@ use regex::Regex;
 use std::fs;
 use std::path::Path;
 
+use crate::patch_binary::RepatchOutcome;
+
 fn detect_stacked_ide(content: &str) -> bool {
     content.contains("/*[AG_PATCHED]*/") || content.contains("[AG_PROXY_HOOK]")
 }
@@ -91,6 +93,35 @@ pub fn patch_ide(_inst: &Path, main_js: &Path) -> Result<(), String> {
         Ok(())
     } else {
         Err("Сигнатура не найдена (возможно, установлена другая версия)".to_string())
+    }
+}
+
+/// Re-applies the IDE `main.js` patch after an update reverted it, classified
+/// the same way as the binary rename so the watchdog can treat every target
+/// uniformly.
+///
+/// `patch_ide` is fail-safe by construction - it writes only when its very
+/// specific regex matches, and errors otherwise without touching the file - so
+/// a build it does not understand yields `SignatureMissing` (leave it, show the
+/// user the error) rather than a corrupted `main.js`. An I/O error (the file
+/// briefly locked mid-update) stays `Failed` so it is retried, not written off.
+pub fn repatch_ide_js(main_js: &Path) -> RepatchOutcome {
+    let content = match fs::read_to_string(main_js) {
+        Ok(c) => c,
+        Err(e) => return RepatchOutcome::Failed(e.to_string()),
+    };
+    if has_marker(&content) && !detect_stacked_ide(&content) {
+        return RepatchOutcome::AlreadyPatched;
+    }
+    match patch_ide(Path::new(""), main_js) {
+        Ok(()) => RepatchOutcome::Repatched(1),
+        // "Signature not found" and "old patch, reinstall" are both give-up
+        // conditions - a human has to act, so surface the app's own error
+        // instead of guessing. Anything else is an I/O problem worth retrying.
+        Err(e) if e.contains("Сигнатура") || e.contains("старая версия") => {
+            RepatchOutcome::SignatureMissing
+        }
+        Err(e) => RepatchOutcome::Failed(e),
     }
 }
 

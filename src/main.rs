@@ -22,6 +22,7 @@ mod patch_gemini;
 mod patch_ide;
 mod resolvers;
 mod utils;
+mod watchdog;
 
 use asar::extract_asar;
 use auth::login_screen;
@@ -138,15 +139,16 @@ pub fn resolve_install_root(raw: &Path) -> Option<PathBuf> {
     None
 }
 
-fn find_all_installs() -> Vec<PathBuf> {
-    let mut installs = Vec::new();
-    let mut candidates = Vec::new();
-
+/// The fixed install locations, before any resolution. Kept separate from
+/// `find_all_installs` so the watchdog can enumerate installs without the
+/// PowerShell registry scan - spawning PowerShell on a timer inside the
+/// background relay would be both wasteful and a stray-window risk.
+fn standard_install_candidates() -> Vec<PathBuf> {
     let local_appdata = env::var("LOCALAPPDATA").unwrap_or_default();
     let prog_files = env::var("PROGRAMFILES").unwrap_or_default();
     let prog_files_x86 = env::var("PROGRAMFILES(X86)").unwrap_or_default();
 
-    let standard_paths = vec![
+    vec![
         PathBuf::from(&local_appdata)
             .join("Programs")
             .join("Antigravity"),
@@ -161,8 +163,26 @@ fn find_all_installs() -> Vec<PathBuf> {
         PathBuf::from(&local_appdata).join("Antigravity IDE"),
         PathBuf::from(&local_appdata).join("agy").join("bin"),
         PathBuf::from(&local_appdata).join("agy"),
-    ];
-    candidates.extend(standard_paths);
+    ]
+}
+
+/// Resolves the standard install locations only - filesystem checks, no
+/// PowerShell. This is what the watchdog polls.
+pub fn discover_installs_fast() -> Vec<PathBuf> {
+    let mut installs = Vec::new();
+    for cand in standard_install_candidates() {
+        if let Some(resolved) = resolve_install_root(&cand) {
+            if !installs.contains(&resolved) {
+                installs.push(resolved);
+            }
+        }
+    }
+    installs
+}
+
+fn find_all_installs() -> Vec<PathBuf> {
+    let mut installs = Vec::new();
+    let mut candidates = standard_install_candidates();
 
     #[cfg(target_os = "windows")]
     {
@@ -395,6 +415,16 @@ fn handle_revert_all() {
 
     kill_affected_processes();
 
+    // Stop the background relay first, and with it the watchdog: if it were
+    // still running it would see each binary revert as an "update" and
+    // immediately re-patch, fighting the very revert in progress.
+    print!("Остановка фоновой DNS-службы... ");
+    io::stdout().flush().ok();
+    match background::disable() {
+        Ok(_) => println!("готово."),
+        Err(e) => println!("\x1b[33mошибка: {}\x1b[0m\x1b[92m", e),
+    }
+
     let installs = find_all_installs();
     if installs.is_empty() {
         println!("Установки Antigravity не найдены.");
@@ -421,13 +451,8 @@ fn handle_revert_all() {
     }
 
     println!("{}", "--------------------------------------------------");
-    print!("Удаление фоновой DNS-службы... ");
-    io::stdout().flush().ok();
-    match background::disable() {
-        Ok(_) => println!("готово."),
-        Err(e) => println!("\x1b[33mошибка: {}\x1b[0m\x1b[92m", e),
-    }
-
+    // The relay (and its watchdog) was already stopped up front, before the
+    // binaries were reverted. Here only the DNS rules are dropped.
     print!("Удаление NRPT-правил DNS... ");
     io::stdout().flush().ok();
     remove_dns_nrpt();
@@ -938,6 +963,9 @@ fn main() {
         // Before anything else: the task launches a console subsystem exe, and
         // the window it gets would otherwise sit on screen for the whole run.
         dns_forwarder::detach_console();
+        // Keep the patch alive across Antigravity's own auto-updates. Runs in
+        // its own thread; the relay loop below is what keeps the process up.
+        watchdog::start();
         if let Err(e) = dns_forwarder::run() {
             dns_forwarder::log_fatal(&e);
             std::process::exit(1);

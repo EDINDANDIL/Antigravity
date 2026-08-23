@@ -94,8 +94,60 @@ pub fn unpatch_binary(bin_path: &Path) -> Result<usize, String> {
     rewrite(bin_path, new_str, old_str)
 }
 
+/// What re-patching one binary found. The background watchdog needs to tell
+/// these four apart where menu 1 only needs success/failure:
+///
+/// - `SignatureMissing` is deliberately distinct from `Failed`. A signature
+///   that is simply gone means a new or broken build this patcher does not
+///   understand, and the right thing is to **leave it alone** so Antigravity
+///   launches and shows its own error - that is the user's cue to fetch a newer
+///   patcher. A `Failed` is transient (the file was locked mid-update) and is
+///   worth retrying.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepatchOutcome {
+    /// Already patched; nothing was done.
+    AlreadyPatched,
+    /// Was reverted (typically by an app auto-update) and is now patched again.
+    Repatched(usize),
+    /// The signature is absent - do not touch it, let the app show its error.
+    SignatureMissing,
+    /// A transient failure, usually a file locked mid-update. Retry later.
+    Failed(String),
+}
+
+/// Re-applies the rename to a binary that may have been reverted by an update.
+///
+/// Unlike `patch_binary`, this never conflates "nothing to patch because the
+/// signature is gone" with "already patched": that distinction is the whole
+/// point of the watchdog. `write_binary` still kills a process holding the file
+/// open and retries, so a running-but-unpatched Language Server is replaced in
+/// the same step - which is what enforces "no unpatched server keeps running"
+/// without ever touching the editor shell.
+pub fn repatch_if_needed(bin_path: &Path) -> RepatchOutcome {
+    obfstr::obfstr! {
+        let from = "ineligible";
+        let to = "inexigible";
+    }
+    let mut data = match fs::read(bin_path) {
+        Ok(d) => d,
+        Err(e) => return RepatchOutcome::Failed(e.to_string()),
+    };
+    let replaced = replace_all(&mut data, from.as_bytes(), to.as_bytes());
+    if replaced == 0 {
+        return if count_occurrences(&data, to.as_bytes()) > 0 {
+            RepatchOutcome::AlreadyPatched
+        } else {
+            RepatchOutcome::SignatureMissing
+        };
+    }
+    match write_binary(bin_path, &data) {
+        Ok(()) => RepatchOutcome::Repatched(replaced),
+        Err(e) => RepatchOutcome::Failed(e),
+    }
+}
+
 /// Native binaries that carry the eligibility check, for a given install root.
-fn binary_targets(inst: &Path) -> Vec<PathBuf> {
+pub fn binary_targets(inst: &Path) -> Vec<PathBuf> {
     let ext_bin = inst
         .join("resources")
         .join("app")
@@ -219,6 +271,44 @@ mod tests {
         let mut data = b"abc".to_vec();
         assert_eq!(replace_all(&mut data, b"ineligible", b"inexigible"), 0);
         assert_eq!(count_occurrences(&data, b"ineligible"), 0);
+    }
+
+    /// The watchdog's four outcomes, on real files. The signature strings are
+    /// obfuscated in the binary but plain here in the test fixtures - the point
+    /// is the classification, not the literals.
+    #[test]
+    fn repatch_classifies_each_case() {
+        let dir = std::env::temp_dir().join("ag_repatch_test");
+        fs::create_dir_all(&dir).expect("temp dir");
+
+        // Reverted by an update: contains the original field name → re-patched.
+        let reverted = dir.join("reverted.bin");
+        fs::write(&reverted, b"..ineligible..ineligible..").unwrap();
+        assert_eq!(repatch_if_needed(&reverted), RepatchOutcome::Repatched(2));
+        // And now it reads back as patched, so a second pass is a no-op.
+        assert_eq!(repatch_if_needed(&reverted), RepatchOutcome::AlreadyPatched);
+
+        // A build whose signature is gone entirely: left untouched on purpose.
+        let unknown = dir.join("unknown.bin");
+        fs::write(&unknown, b"a totally different binary layout").unwrap();
+        assert_eq!(
+            repatch_if_needed(&unknown),
+            RepatchOutcome::SignatureMissing
+        );
+        // Crucially it was NOT modified - the app must run and show its error.
+        assert_eq!(
+            fs::read(&unknown).unwrap(),
+            b"a totally different binary layout"
+        );
+
+        // A path that does not exist is a failure, not a missing signature:
+        // "retry", never "give up and hide the error".
+        match repatch_if_needed(&dir.join("nope.bin")) {
+            RepatchOutcome::Failed(_) => {}
+            other => panic!("expected Failed, got {:?}", other),
+        }
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     /// End-to-end check against the installed Language Server: patch a copy,

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Mutex;
@@ -121,6 +121,25 @@ const PROXY_SET_TTL: Duration = Duration::from_secs(30 * 60);
 /// Proxy addresses learned per provider, with the moment the entry was last
 /// refreshed.
 static PROXY_SET: Mutex<Option<HashMap<usize, (Vec<IpAddr>, Instant)>>> = Mutex::new(None);
+
+/// A substituted address is only useful if the client can actually open a TLS
+/// connection to it, and that does not follow from answering DNS: geohide hands
+/// out three proxy addresses for `daily-cloudcode-pa` and `95.182.120.241`
+/// silently drops SYNs on 443. Handing it to the client cost ~20 s on the first
+/// connection - Windows' SYN retransmission budget - before it fell through to
+/// a live address. So substituted addresses are probed on the port the client
+/// will use, and the dead ones are cut out of the answer.
+const LIVENESS_PORT: u16 = 443;
+/// Probed on the default route rather than the ISP interface: DNS has to dodge
+/// the tunnel, but the client's own connection will not, so this must ask the
+/// question the client is going to ask.
+const LIVENESS_BUDGET: Duration = Duration::from_millis(500);
+const LIVENESS_TTL_ALIVE: Duration = Duration::from_secs(10 * 60);
+/// Short, so an address that comes back is used again within a minute or two
+/// rather than being written off for the rest of the session.
+const LIVENESS_TTL_DEAD: Duration = Duration::from_secs(60);
+
+static LIVENESS: Mutex<Option<HashMap<IpAddr, (bool, Instant)>>> = Mutex::new(None);
 
 /// Rotates which provider wins a tie, so equally good providers share the load
 /// instead of the first entry serving everything.
@@ -247,6 +266,108 @@ fn rank(v: Verdict) -> u8 {
     }
 }
 
+fn cached_liveness(addr: &IpAddr) -> Option<bool> {
+    let guard = LIVENESS.lock().ok()?;
+    let (alive, at) = guard.as_ref()?.get(addr)?;
+    let ttl = if *alive {
+        LIVENESS_TTL_ALIVE
+    } else {
+        LIVENESS_TTL_DEAD
+    };
+    (at.elapsed() < ttl).then_some(*alive)
+}
+
+fn remember_liveness(addr: IpAddr, alive: bool) {
+    if let Ok(mut guard) = LIVENESS.lock() {
+        guard
+            .get_or_insert_with(HashMap::new)
+            .insert(addr, (alive, Instant::now()));
+    }
+}
+
+/// The addresses among `addrs` that will not accept a connection.
+///
+/// A live proxy completes the handshake in tens of milliseconds; a black hole
+/// never answers at all, so the budget separates them without waiting out the
+/// operating system's own retransmission schedule. Unknown-because-slow counts
+/// as dead only for `LIVENESS_TTL_DEAD`, which is short on purpose.
+fn dead_addrs(addrs: &[IpAddr]) -> Vec<IpAddr> {
+    let mut dead = Vec::new();
+    let mut unknown = Vec::new();
+    for a in addrs {
+        match cached_liveness(a) {
+            Some(true) => {}
+            Some(false) => dead.push(*a),
+            None => unknown.push(*a),
+        }
+    }
+    if unknown.is_empty() {
+        return dead;
+    }
+
+    let (tx, rx) = mpsc::channel::<(IpAddr, bool)>();
+    for a in &unknown {
+        let tx = tx.clone();
+        let addr = *a;
+        thread::spawn(move || {
+            let ok = std::net::TcpStream::connect_timeout(
+                &SocketAddr::new(addr, LIVENESS_PORT),
+                LIVENESS_BUDGET,
+            )
+            .is_ok();
+            tx.send((addr, ok)).ok();
+        });
+    }
+    drop(tx);
+
+    let deadline = Instant::now() + LIVENESS_BUDGET;
+    let mut answered = 0usize;
+    while answered < unknown.len() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(left) {
+            Ok((addr, alive)) => {
+                answered += 1;
+                remember_liveness(addr, alive);
+                if !alive {
+                    dead.push(addr);
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    // Whatever did not answer inside the budget is treated as dead for now. It
+    // is not written off: the next query re-probes it after LIVENESS_TTL_DEAD.
+    for a in unknown {
+        if cached_liveness(&a).is_none() {
+            remember_liveness(a, false);
+            dead.push(a);
+        }
+    }
+    dead
+}
+
+/// Cuts unreachable addresses out of a substituted answer.
+///
+/// Only substituted answers are filtered. A passthrough is Google's own edge
+/// and needs no vetting, and probing it would put a TCP connection on every
+/// name the relay ever sees for nothing.
+fn drop_dead_addrs(reply: Vec<u8>) -> Vec<u8> {
+    let addrs = dns_client::answer_addrs(&reply);
+    if addrs.len() < 2 {
+        // With a single address there is nothing to fall through to, so
+        // removing it would turn a slow answer into no answer.
+        return reply;
+    }
+    let dead = dead_addrs(&addrs);
+    if dead.is_empty() {
+        return reply;
+    }
+    dns_client::without_addrs(&reply, &dead).unwrap_or(reply)
+}
+
 /// What is currently known about a provider's proxy addresses.
 fn known_proxy_addrs(idx: usize) -> Vec<IpAddr> {
     let Ok(guard) = PROXY_SET.lock() else {
@@ -363,7 +484,7 @@ pub fn resolve_best(query: &[u8], if_index: u32) -> Option<(Vec<u8>, &'static st
 
     if let Some((idx, verdict)) = cached_choice(&key) {
         if let Some(reply) = ask_provider(&PROVIDERS[idx], query, if_index) {
-            return Some((reply, PROVIDERS[idx].name, verdict));
+            return Some((vet(reply, verdict), PROVIDERS[idx].name, verdict));
         }
         // The chosen provider went away; re-race rather than keep asking it.
         forget_choice(&key);
@@ -487,7 +608,11 @@ pub fn resolve_best(query: &[u8], if_index: u32) -> Option<(Vec<u8>, &'static st
             if let Some(hit) = pick(&replies, &reference, Verdict::Substituted) {
                 remember_choice(key, replies[hit].0, Verdict::Substituted);
                 let (idx, reply) = replies.swap_remove(hit);
-                return Some((reply, PROVIDERS[idx].name, Verdict::Substituted));
+                return Some((
+                    vet(reply, Verdict::Substituted),
+                    PROVIDERS[idx].name,
+                    Verdict::Substituted,
+                ));
             }
         }
         if replies.len() == PROVIDERS.len() && got_reference && !still_learning {
@@ -509,7 +634,18 @@ pub fn resolve_best(query: &[u8], if_index: u32) -> Option<(Vec<u8>, &'static st
     );
     remember_choice(key, replies[best].0, verdict);
     let (idx, reply) = replies.swap_remove(best);
-    Some((reply, PROVIDERS[idx].name, verdict))
+    Some((vet(reply, verdict), PROVIDERS[idx].name, verdict))
+}
+
+/// Filters a reply before it goes back to the client, but only when it is a
+/// substitution - that is the only case where the addresses belong to a third
+/// party rather than to Google.
+fn vet(reply: Vec<u8>, verdict: Verdict) -> Vec<u8> {
+    if verdict == Verdict::Substituted {
+        drop_dead_addrs(reply)
+    } else {
+        reply
+    }
 }
 
 /// Resolves `name` the same way, for callers that want addresses rather than a

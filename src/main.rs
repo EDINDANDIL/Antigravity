@@ -15,6 +15,7 @@ mod dns;
 mod dns_client;
 mod dns_forwarder;
 mod egress;
+mod endpoint;
 mod hosts_pin;
 mod patch_binary;
 mod patch_gemini;
@@ -220,6 +221,25 @@ fn restore_pristine_asar(resources: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Says out loud what happened to the CloudCode endpoint.
+///
+/// `Unsupported` is reported rather than swallowed: a future IDE build could
+/// rename or drop the setting, and a key nothing reads would otherwise look
+/// exactly like a successful patch.
+fn report_endpoint(outcome: Result<endpoint::Outcome, String>) {
+    match outcome {
+        Ok(endpoint::Outcome::Applied) => {
+            println!("  [OK] Эндпоинт CloudCode переключён на daily-cloudcode-pa")
+        }
+        Ok(endpoint::Outcome::AlreadySet) => println!("  [OK] Эндпоинт CloudCode — уже переключён"),
+        Ok(endpoint::Outcome::Unsupported) => println!(
+            "  [33m[WARN] В этой сборке IDE нет настройки {} — эндпоинт не переключён[0m[92m",
+            endpoint::IDE_SETTING
+        ),
+        Err(e) => println!("  [33m[WARN] Эндпоинт не переключён: {}[0m[92m", e),
+    }
+}
+
 fn process_install(install: &Path) -> Result<String, String> {
     // Patch all relevant binaries (Language Server / CLI).
     let bin_summary = patch_all_binaries(install);
@@ -265,6 +285,9 @@ fn process_install(install: &Path) -> Result<String, String> {
         if let Err(e) = patch_extension_js(install) {
             println!("{} {}", "[WARN] Патч extension.js пропущен:", e);
         }
+        // Desktop already ships pointing at the daily host; only the IDE has to
+        // be told, and it has a supported setting for exactly that.
+        report_endpoint(endpoint::apply_ide(install));
         return Ok("Antigravity IDE".to_string());
     } else if desktop_js.exists() {
         let js_patched = patch_desktop(install, &desktop_js)?;
@@ -276,6 +299,17 @@ fn process_install(install: &Path) -> Result<String, String> {
     } else if install.join("agy.exe").exists() {
         if bin_summary.ok == 0 {
             return Err(binary_failure_message(&bin_summary));
+        }
+        // The CLI has no settings file; it reads an environment variable.
+        match endpoint::apply_cli() {
+            Ok(endpoint::Outcome::AlreadySet) => {
+                println!("  [OK] Эндпоинт CloudCode — уже переключён")
+            }
+            Ok(_) => println!(
+                "  [OK] Эндпоинт CloudCode переключён ({} — нужен новый терминал)",
+                endpoint::CLI_ENV_VAR
+            ),
+            Err(e) => println!("  [33m[WARN] Эндпоинт не переключён: {}[0m[92m", e),
         }
         return Ok("Antigravity CLI".to_string());
     }
@@ -378,6 +412,9 @@ fn handle_revert_all() {
         if let Err(e) = restore_pristine_asar(&inst.join("resources")) {
             println!("  \x1b[33m[ERR] {}\x1b[0m\x1b[92m", e);
         }
+        if let Err(e) = endpoint::remove_ide(inst) {
+            println!("  \x1b[33m[ERR] {}\x1b[0m\x1b[92m", e);
+        }
         if n > 0 {
             reverted.push(mask_path(&inst.display().to_string()));
         }
@@ -395,6 +432,13 @@ fn handle_revert_all() {
     io::stdout().flush().ok();
     remove_dns_nrpt();
     println!("готово.");
+
+    print!("Возврат эндпоинта CloudCode... ");
+    io::stdout().flush().ok();
+    match endpoint::remove_cli() {
+        Ok(_) => println!("готово."),
+        Err(e) => println!("\x1b[33mошибка: {}\x1b[0m\x1b[92m", e),
+    }
 
     print_results(&reverted, &[]);
 }

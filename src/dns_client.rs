@@ -197,6 +197,100 @@ pub fn answer_addrs(buf: &[u8]) -> Vec<IpAddr> {
     out
 }
 
+/// Removes the given addresses from the answer section and fixes ANCOUNT.
+///
+/// Needed because a provider can hand out an address that answers DNS but not
+/// TCP: geohide returns three proxy addresses for `daily-cloudcode-pa` and one
+/// of them black-holes port 443, which cost ~20 s on the first connection -
+/// Windows' SYN retransmission budget - before the client fell through to a
+/// live one.
+///
+/// Deliberately conservative. Names in a DNS message may be compression
+/// pointers, and removing bytes shifts every offset after them, so this edits
+/// only the shape it can prove is safe: no authority section, and an additional
+/// section that is either empty or a single OPT whose name is the root label.
+/// In that shape the only names are the question and back-pointers to it, both
+/// of which sit before anything this removes. Anything else is left untouched -
+/// `None` means "hand the original back".
+pub fn without_addrs(reply: &[u8], drop: &[IpAddr]) -> Option<Vec<u8>> {
+    if reply.len() < 12 || drop.is_empty() {
+        return None;
+    }
+    let questions = u16::from_be_bytes([reply[4], reply[5]]) as usize;
+    let answers = u16::from_be_bytes([reply[6], reply[7]]) as usize;
+    let authority = u16::from_be_bytes([reply[8], reply[9]]) as usize;
+    let additional = u16::from_be_bytes([reply[10], reply[11]]) as usize;
+    if authority != 0 || additional > 1 || answers == 0 {
+        return None;
+    }
+
+    let mut i = 12;
+    for _ in 0..questions {
+        i = skip_name(reply, i)? + 4;
+    }
+    let question_end = i;
+
+    let mut kept: Vec<(usize, usize)> = Vec::new();
+    let mut removed = 0usize;
+    for _ in 0..answers {
+        let start = i;
+        let after_name = skip_name(reply, i)?;
+        if after_name + 10 > reply.len() {
+            return None;
+        }
+        let rtype = u16::from_be_bytes([reply[after_name], reply[after_name + 1]]);
+        let rdlen = u16::from_be_bytes([reply[after_name + 8], reply[after_name + 9]]) as usize;
+        let rdata = after_name + 10;
+        let end = rdata.checked_add(rdlen)?;
+        if end > reply.len() {
+            return None;
+        }
+        let addr = match (rtype, rdlen) {
+            (1, 4) => Some(IpAddr::V4(Ipv4Addr::new(
+                reply[rdata],
+                reply[rdata + 1],
+                reply[rdata + 2],
+                reply[rdata + 3],
+            ))),
+            (28, 16) => {
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&reply[rdata..rdata + 16]);
+                Some(IpAddr::V6(std::net::Ipv6Addr::from(octets)))
+            }
+            _ => None,
+        };
+        if addr.is_some_and(|a| drop.contains(&a)) {
+            removed += 1;
+        } else {
+            kept.push((start, end));
+        }
+        i = end;
+    }
+
+    // Nothing to do, or everything would go: an empty answer is worse than a
+    // slow one, because the client then has nothing to fall through to.
+    if removed == 0 || kept.is_empty() {
+        return None;
+    }
+    // The tail is the OPT record, if the reply carried one. Only a root name is
+    // accepted, since that is the one name that cannot be a pointer.
+    let tail = &reply[i..];
+    if additional == 1 && (tail.len() < 11 || tail[0] != 0) {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(reply.len());
+    out.extend_from_slice(&reply[..12]);
+    let count = (answers - removed) as u16;
+    out[6..8].copy_from_slice(&count.to_be_bytes());
+    out.extend_from_slice(&reply[12..question_end]);
+    for (start, end) in kept {
+        out.extend_from_slice(&reply[start..end]);
+    }
+    out.extend_from_slice(tail);
+    Some(out)
+}
+
 /// The qtype of the question. Only A and AAAA answers can be compared against a
 /// reference resolver, so the relay has to know which it is looking at.
 pub fn question_type(buf: &[u8]) -> Option<u16> {
@@ -359,6 +453,87 @@ mod tests {
         msg[6] = 0x00;
         msg[7] = 0x40; // claim 64 answers, ship one
         assert_eq!(parse_a_records(&msg, 7), vec![Ipv4Addr::new(1, 2, 3, 4)]);
+    }
+
+    /// The reply shape this is allowed to edit: question, then A records whose
+    /// name is a pointer back to it. `opt` appends an EDNS0 OPT record, whose
+    /// root name is the one name that cannot be a compression pointer.
+    fn reply_with(id: u16, addrs: &[[u8; 4]], opt: bool) -> Vec<u8> {
+        let mut b = response(id, addrs);
+        if opt {
+            b[11] = 1; // ARCOUNT
+            b.extend_from_slice(&[0, 0x00, 0x29, 0x10, 0x00, 0, 0, 0, 0, 0x00, 0x00]);
+        }
+        b
+    }
+
+    fn v4(s: &str) -> IpAddr {
+        IpAddr::V4(s.parse().unwrap())
+    }
+
+    #[test]
+    fn a_dead_address_is_cut_out_and_the_count_fixed() {
+        // The real case: geohide's three proxy addresses, the last one a black
+        // hole on 443.
+        let msg = reply_with(
+            9,
+            &[[45, 155, 204, 190], [37, 230, 192, 51], [95, 182, 120, 241]],
+            false,
+        );
+        let out = without_addrs(&msg, &[v4("95.182.120.241")]).expect("rewritten");
+        assert_eq!(
+            u16::from_be_bytes([out[6], out[7]]),
+            2,
+            "ANCOUNT must follow"
+        );
+        assert_eq!(
+            answer_addrs(&out),
+            vec![v4("45.155.204.190"), v4("37.230.192.51")]
+        );
+        assert_eq!(&out[0..6], &msg[0..6], "header and question untouched");
+    }
+
+    /// An OPT record has to survive the edit, or a client that asked with EDNS0
+    /// gets a reply that has quietly lost it.
+    #[test]
+    fn the_opt_record_survives() {
+        let msg = reply_with(9, &[[1, 1, 1, 1], [2, 2, 2, 2]], true);
+        let out = without_addrs(&msg, &[v4("1.1.1.1")]).expect("rewritten");
+        assert_eq!(u16::from_be_bytes([out[10], out[11]]), 1, "ARCOUNT kept");
+        assert_eq!(&out[out.len() - 11..], &msg[msg.len() - 11..]);
+        assert_eq!(answer_addrs(&out), vec![v4("2.2.2.2")]);
+    }
+
+    /// Never hand back an empty answer: the client would have nothing to fall
+    /// through to, which is worse than one slow address.
+    #[test]
+    fn removing_everything_is_refused() {
+        let msg = reply_with(9, &[[1, 1, 1, 1]], false);
+        assert!(without_addrs(&msg, &[v4("1.1.1.1")]).is_none());
+    }
+
+    #[test]
+    fn nothing_to_remove_leaves_the_reply_alone() {
+        let msg = reply_with(9, &[[1, 1, 1, 1], [2, 2, 2, 2]], false);
+        assert!(without_addrs(&msg, &[v4("9.9.9.9")]).is_none());
+        assert!(without_addrs(&msg, &[]).is_none());
+    }
+
+    /// An authority section may carry pointers into the bytes being removed, so
+    /// that shape is refused outright rather than edited on a guess.
+    #[test]
+    fn a_reply_with_an_authority_section_is_refused() {
+        let mut msg = reply_with(9, &[[1, 1, 1, 1], [2, 2, 2, 2]], false);
+        msg[9] = 1; // NSCOUNT
+        assert!(without_addrs(&msg, &[v4("1.1.1.1")]).is_none());
+    }
+
+    #[test]
+    fn truncated_input_does_not_panic_while_rewriting() {
+        let msg = reply_with(9, &[[1, 1, 1, 1], [2, 2, 2, 2]], true);
+        for cut in 0..msg.len() {
+            let _ = without_addrs(&msg[..cut], &[v4("1.1.1.1")]);
+        }
     }
 
     #[test]

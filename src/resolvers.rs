@@ -27,6 +27,7 @@ use crate::dns_client;
 
 /// One unblock service. Addresses are tried in order; the first that answers
 /// speaks for the provider, so a dead front-end does not cost it the race.
+#[derive(Clone, Copy)]
 pub struct Provider {
     pub name: &'static str,
     pub v4: &'static [&'static str],
@@ -54,6 +55,70 @@ pub const PROVIDERS: &[Provider] = &[
         v6: &["2a0c:9300:0:54::1"],
     },
 ];
+
+/// Effective resolver for a given slot. Slot 0 is the default provider (the
+/// first entry in `PROVIDERS`), but it can be overridden at runtime through the
+/// `AG_UNLOCKER_DNS` / `AG_UNLOCKER_DNS6` environment variables - the menu
+/// "Смена адреса DNS-резолвера" writes those. The override only ever replaces
+/// slot 0, so provider indices stay stable and the choice/proxy caches remain
+/// valid. `malw.link` is NOT one of the built-in `PROVIDERS`; it is reachable
+/// only via the runtime environment override (e.g. the menu preset).
+static ENV_OVERRIDE: Mutex<Option<(String, &'static Provider)>> = Mutex::new(None);
+
+fn build_env_provider() -> Option<Provider> {
+    let raw_v4 = std::env::var("AG_UNLOCKER_DNS").ok()?;
+    let v4: Vec<&'static str> = raw_v4
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| &*Box::leak(s.to_string().into_boxed_str()))
+        .collect();
+    if v4.is_empty() {
+        return None;
+    }
+    let raw_v6 = std::env::var("AG_UNLOCKER_DNS6").unwrap_or_default();
+    let v6: Vec<&'static str> = raw_v6
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| &*Box::leak(s.to_string().into_boxed_str()))
+        .collect();
+    Some(Provider {
+        name: "env",
+        v4: &*Box::leak(v4.into_boxed_slice()),
+        v6: &*Box::leak(v6.into_boxed_slice()),
+    })
+}
+
+fn env_provider() -> Option<Provider> {
+    let key = format!(
+        "AG_UNLOCKER_DNS={}|AG_UNLOCKER_DNS6={}",
+        std::env::var("AG_UNLOCKER_DNS").unwrap_or_default(),
+        std::env::var("AG_UNLOCKER_DNS6").unwrap_or_default()
+    );
+    if key.is_empty() {
+        return None;
+    }
+    let mut guard = ENV_OVERRIDE.lock().ok()?;
+    if let Some((k, p)) = guard.as_ref() {
+        if *k == key {
+            return Some(**p);
+        }
+    }
+    let built = build_env_provider()?;
+    let leaked: &'static Provider = Box::leak(Box::new(built));
+    *guard = Some((key, leaked));
+    Some(*leaked)
+}
+
+fn provider_for(idx: usize) -> Provider {
+    if idx == 0 {
+        if let Some(p) = env_provider() {
+            return p;
+        }
+    }
+    PROVIDERS[idx]
+}
 
 /// Resolvers used only to recognise an unsubstituted answer. They must be
 /// services with no geo-unblocking of their own - that is the whole point of
@@ -154,9 +219,8 @@ static CHOICE: Mutex<Option<HashMap<(String, u16), (usize, Verdict, Instant)>>> 
 /// these only when the relay is off - with the relay up a v6 nameserver would
 /// let Windows send the query straight out, skipping the relay entirely.
 pub fn all_v6() -> Vec<&'static str> {
-    PROVIDERS
-        .iter()
-        .flat_map(|p| p.v6.iter().copied())
+    (0..PROVIDERS.len())
+        .flat_map(|i| provider_for(i).v6.iter().copied())
         .collect()
 }
 
@@ -164,9 +228,8 @@ pub fn all_v6() -> Vec<&'static str> {
 /// nameservers in order, so listing every address of one provider ahead of the
 /// next provider would make a provider outage look like a total failure.
 pub fn fallback_v4() -> Vec<&'static str> {
-    PROVIDERS
-        .iter()
-        .filter_map(|p| p.v4.first().copied())
+    (0..PROVIDERS.len())
+        .filter_map(|i| provider_for(i).v4.first().copied())
         .collect()
 }
 
@@ -483,8 +546,8 @@ pub fn resolve_best(query: &[u8], if_index: u32) -> Option<(Vec<u8>, &'static st
     let classifiable = qtype == QTYPE_A || qtype == QTYPE_AAAA;
 
     if let Some((idx, verdict)) = cached_choice(&key) {
-        if let Some(reply) = ask_provider(&PROVIDERS[idx], query, if_index) {
-            return Some((vet(reply, verdict), PROVIDERS[idx].name, verdict));
+        if let Some(reply) = ask_provider(&provider_for(idx), query, if_index) {
+            return Some((vet(reply, verdict), provider_for(idx).name, verdict));
         }
         // The chosen provider went away; re-race rather than keep asking it.
         forget_choice(&key);
@@ -494,8 +557,8 @@ pub fn resolve_best(query: &[u8], if_index: u32) -> Option<(Vec<u8>, &'static st
         let start = ROTATION.fetch_add(1, Ordering::Relaxed);
         for step in 0..PROVIDERS.len() {
             let idx = (start + step) % PROVIDERS.len();
-            if let Some(reply) = ask_provider(&PROVIDERS[idx], query, if_index) {
-                return Some((reply, PROVIDERS[idx].name, Verdict::Unknown));
+            if let Some(reply) = ask_provider(&provider_for(idx), query, if_index) {
+                return Some((reply, provider_for(idx).name, Verdict::Unknown));
             }
         }
         return None;
@@ -506,7 +569,7 @@ pub fn resolve_best(query: &[u8], if_index: u32) -> Option<(Vec<u8>, &'static st
         let tx = tx.clone();
         let q = query.to_vec();
         thread::spawn(move || {
-            if let Some(reply) = ask_provider(&PROVIDERS[idx], &q, if_index) {
+            if let Some(reply) = ask_provider(&provider_for(idx), &q, if_index) {
                 tx.send(Heat::Provider(idx, reply)).ok();
             }
         });
@@ -539,7 +602,7 @@ pub fn resolve_best(query: &[u8], if_index: u32) -> Option<(Vec<u8>, &'static st
             let tx = tx.clone();
             let q = control.clone();
             thread::spawn(move || {
-                if let Some(reply) = ask_provider(&PROVIDERS[idx], &q, if_index) {
+                if let Some(reply) = ask_provider(&provider_for(idx), &q, if_index) {
                     tx.send(Heat::Control(idx, dns_client::answer_addrs(&reply)))
                         .ok();
                 }
@@ -610,7 +673,7 @@ pub fn resolve_best(query: &[u8], if_index: u32) -> Option<(Vec<u8>, &'static st
                 let (idx, reply) = replies.swap_remove(hit);
                 return Some((
                     vet(reply, Verdict::Substituted),
-                    PROVIDERS[idx].name,
+                    provider_for(idx).name,
                     Verdict::Substituted,
                 ));
             }
@@ -634,7 +697,7 @@ pub fn resolve_best(query: &[u8], if_index: u32) -> Option<(Vec<u8>, &'static st
     );
     remember_choice(key, replies[best].0, verdict);
     let (idx, reply) = replies.swap_remove(best);
-    Some((vet(reply, verdict), PROVIDERS[idx].name, verdict))
+    Some((vet(reply, verdict), provider_for(idx).name, verdict))
 }
 
 /// Filters a reply before it goes back to the client, but only when it is a

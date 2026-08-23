@@ -936,6 +936,196 @@ fn handle_manual_path() {
     print_results(&successes, &failures);
 }
 
+/// Menu: change the DNS resolver address without rebuilding. Prompts for the new
+/// IPv4/IPv6, validates, stores it in the user environment (no external file),
+/// and re-applies the DNS patch when running as administrator.
+fn handle_change_resolver() {
+    clear_screen();
+    println!("{}", APP_TITLE);
+    println!();
+        println!("Смена адреса DNS-резолвера (по умолчанию: geohide — штатный фикс)");
+    let cur_v4: Vec<String> = std::env::var("AG_UNLOCKER_DNS")
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let cur_v6: Vec<String> = std::env::var("AG_UNLOCKER_DNS6")
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    if !cur_v4.is_empty() || !cur_v6.is_empty() {
+        println!(
+            "Текущий: v4={} v6={}",
+            cur_v4.join(","),
+            if cur_v6.is_empty() {
+                "-".to_string()
+            } else {
+                cur_v6.join(",")
+            }
+        );
+    }
+    println!("Введите IPv4-адрес(а) через запятую, например: 1.2.3.4,5.6.7.8");
+    println!("IPv6 можно ввести со следующей строки (или оставить пустым).");
+    println!();
+
+    let mut input = String::new();
+    print!("IPv4> ");
+    io::stdout().flush().unwrap();
+    io::stdin().read_line(&mut input).unwrap_or(0);
+    let v4_raw = input.trim().to_string();
+
+    let mut input6 = String::new();
+    print!("IPv6> ");
+    io::stdout().flush().unwrap();
+    io::stdin().read_line(&mut input6).unwrap_or(0);
+    let v6_raw = input6.trim().to_string();
+
+    let v4: Vec<&str> = v4_raw
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let v6: Vec<&str> = v6_raw
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if v4.is_empty() && v6.is_empty() {
+        println!("{}", "Адрес не введён — отмена.");
+        thread::sleep(Duration::from_secs(2));
+        return;
+    }
+    for ip in v4.iter().chain(v6.iter()) {
+        if ip.parse::<std::net::IpAddr>().is_err() {
+            println!("{}", format!("Некорректный IP: {}", ip));
+            thread::sleep(Duration::from_secs(2));
+            return;
+        }
+    }
+
+    // Apply to the running process so the immediate re-apply below uses the new value.
+    if !v4.is_empty() {
+        std::env::set_var("AG_UNLOCKER_DNS", v4.join(","));
+    }
+    if !v6.is_empty() {
+        std::env::set_var("AG_UNLOCKER_DNS6", v6.join(","));
+    }
+    // Persist for future launches via the user environment (no external file).
+    if !v4.is_empty() {
+        let _ = std::process::Command::new("setx")
+            .args(["AG_UNLOCKER_DNS", &v4.join(",")])
+            .output();
+    }
+    if !v6.is_empty() {
+        let _ = std::process::Command::new("setx")
+            .args(["AG_UNLOCKER_DNS6", &v6.join(",")])
+            .output();
+    }
+    println!("{}", "Адрес сохранён в переменные окружения (AG_UNLOCKER_DNS).");
+
+    if is_admin() {
+        println!("Применяю DNS-правила с новым адресом...");
+        apply_dns_patch(false);
+    } else {
+        println!(
+            "{}",
+            "Готово. Чтобы новый адрес вступил в силу, запустите программу от \
+             имени Администратора и перепримените разблокировку (пункт 1)."
+        );
+    }
+    thread::sleep(Duration::from_secs(3));
+}
+
+/// Menu: switch the resolver that substitutes the CloudCode endpoint. Offers a
+/// few known-good presets plus a fallback to the manual address entry. The
+/// choice is stored in `AG_UNLOCKER_DNS` (no external file) so it takes effect
+/// without a rebuild. A warning makes clear that any chosen resolver is a
+/// man-in-the-middle for the AI endpoint's traffic.
+fn handle_switch_resolver() {
+    clear_screen();
+    println!("{}", APP_TITLE);
+    println!();
+    println!("Смена резолвера (DNS, через который подменяется CloudCode)");
+    println!();
+    println!(
+        "{}ВНИМАНИЕ: выбранный резолвер видит ваши DNS-запросы к CloudCode{}",
+        "\x1b[93m", "\x1b[0m"
+    );
+    println!("и подставляет адрес своего прокси — то есть он посредник в трафике");
+    println!("к AI-эндпоинту. Используйте только резолверы, которым доверяете;");
+    println!("злонамеренный резолвер может перехватить этот траф...)");
+    println!();
+    let cur = std::env::var("AG_UNLOCKER_DNS").unwrap_or_default();
+    if cur.is_empty() {
+        println!("Текущий резолвер: дефолтный (geohide — штатный фикс для daily-cloudcode-pa)");
+    } else {
+        println!("Текущий резолвер: {}", cur);
+    }
+    println!();
+    println!("По умолчанию (без выбора) подставляется geohide — штатный фикс для daily-cloudcode-pa.");
+    println!("1. malw.link (193.23.209.189)");
+    println!("2. xbox-dns.ru (111.88.96.50)");
+    println!("3. comss.one (83.220.169.155)");
+    println!("4. geohide.ru (45.155.204.190)");
+    println!("5. Свой адрес (ввести вручную)");
+    println!("0. Назад");
+    println!();
+    match prompt("> ").as_str() {
+        "1" => set_resolver(Some("193.23.209.189")),
+        "2" => set_resolver(Some("111.88.96.50")),
+        "3" => set_resolver(Some("83.220.169.155")),
+        "4" => set_resolver(Some("45.155.204.190")),
+        "5" => handle_change_resolver(),
+        "0" => return,
+        _ => {
+            println!("{}", "Неверный выбор.");
+            thread::sleep(Duration::from_secs(1));
+        }
+    }
+}
+
+/// Sets or clears the active resolver. `None` restores the built-in default
+/// (the provider race); `Some(addr)` pins slot 0 to `addr` via `AG_UNLOCKER_DNS`.
+fn set_resolver(addr: Option<&str>) {
+    match addr {
+        None => {
+            std::env::remove_var("AG_UNLOCKER_DNS");
+            std::env::remove_var("AG_UNLOCKER_DNS6");
+            let _ = std::process::Command::new("reg")
+                .args(["delete", "HKCU\\Environment", "/v", "AG_UNLOCKER_DNS", "/f"])
+                .output();
+            let _ = std::process::Command::new("reg")
+                .args(["delete", "HKCU\\Environment", "/v", "AG_UNLOCKER_DNS6", "/f"])
+                .output();
+            println!("Резолвер сброшен на дефолтный.");
+        }
+        Some(a) => {
+            std::env::set_var("AG_UNLOCKER_DNS", a);
+            let _ = std::process::Command::new("setx")
+                .args(["AG_UNLOCKER_DNS", a])
+                .output();
+            println!("Установлен резолвер: {}", a);
+        }
+    }
+    if is_admin() {
+        apply_dns_patch(false);
+    } else {
+        println!(
+            "{}",
+            "Примените повторно пункт 1 от Администратора, чтобы NRPT обновился под новый резолвер."
+        );
+    }
+    thread::sleep(Duration::from_secs(2));
+}
+
 fn show_admin_prewarning() {
     clear_screen();
     println!("{}", APP_TITLE);
@@ -1013,6 +1203,22 @@ fn main() {
             "5. Отблагодарить копеечкой ({})",
             link(DONATE_URL, DONATE_URL)
         );
+        println!(
+            "8. Сменить адрес DNS-резолвера (без пересборки{})",
+            if !is_admin() && !is_nrpt_applied() {
+                " — применение требует Администратора"
+            } else {
+                ""
+            }
+        );
+        println!(
+            "9. Сменить резолвер (пресеты: geohide / malw.link / …){}",
+            if !is_admin() && !is_nrpt_applied() {
+                " — применение требует Администратора"
+            } else {
+                ""
+            }
+        );
         // Yellow-green (256-color 154) for the two "undo" actions; reset then
         // restore the menu's bright-green afterwards.
         println!("\x1b[38;5;154m6. Отключить DNS-службу и NRPT (отключит исправление ошибок \"400\")\x1b[0m\x1b[92m");
@@ -1031,6 +1237,8 @@ fn main() {
             "3" => handle_manual_path(),
             "4" => open_url(TELEGRAM_URL),
             "5" => open_url(DONATE_URL),
+            "8" => handle_change_resolver(),
+            "9" => handle_switch_resolver(),
             "6" => handle_restore_dns(),
             "7" => handle_revert_all(),
             "0" => break,

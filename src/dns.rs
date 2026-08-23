@@ -1,12 +1,11 @@
-use std::net::Ipv4Addr;
 use std::process::Command;
 use std::sync::Mutex;
 
 use crate::background;
-use crate::dns_client;
 use crate::dns_forwarder;
 use crate::egress::{self, Egress};
 use crate::hosts_pin;
+use crate::resolvers;
 use crate::utils::{no_window, powershell};
 
 // NRPT-based selective DNS routing. Only the exact hostnames that Antigravity
@@ -37,8 +36,9 @@ const AG_NRPT_CORE: &[&str] = &[
 // Only needed for the Gemini CLI flow (the API-key page must open in a browser).
 const AG_NRPT_GEMINI: &[&str] = &["aistudio.google.com"];
 
-// xbox-dns.ru servers live in `egress` - the rules and the direct queries that
-// bypass a VPN have to name the same addresses.
+// The unblock resolvers live in `resolvers` - the rules and the relay have to
+// name the same services, and which of them actually substitutes a given name
+// is decided per query rather than assumed here.
 
 const IPV4_PREFIX: &str = "::ffff:0:0/96";
 // Windows default precedence for the IPv4-mapped prefix.
@@ -187,9 +187,13 @@ fn nameserver_list(via_relay: bool) -> String {
     if via_relay {
         servers.push(dns_forwarder::LISTEN_IP);
     }
-    servers.extend_from_slice(egress::NS_V4);
+    // One address per provider rather than every address of one: Windows walks
+    // the list in order, so listing both xbox-dns fronts first would make an
+    // xbox-dns outage look like a total failure while comss and geohide sit
+    // unused behind them.
+    servers.extend_from_slice(&resolvers::fallback_v4());
     if !via_relay {
-        servers.extend_from_slice(egress::NS_V6);
+        servers.extend_from_slice(&resolvers::all_v6());
     }
     ps_string_list(&servers)
 }
@@ -280,26 +284,26 @@ fn parse_conflicts(output: &str, namespaces: &[&str]) -> Vec<String> {
     found
 }
 
-/// Resolves each routed namespace through the ISP link and pins whatever the
-/// resolver substitutes into `hosts`. Only addresses that actually differ from
-/// the tunnel's answer are written: a genuine Google address in `hosts` buys
-/// nothing and goes stale the moment Google rotates its edge.
+/// Resolves each routed namespace through the ISP link and pins whatever a
+/// provider substitutes into `hosts`. Only genuinely substituted addresses are
+/// written: a real Google address in `hosts` buys nothing and goes stale the
+/// moment Google rotates its edge.
+///
+/// The "substituted?" question used to be answered by resolving twice - once
+/// bound to the ISP link, once left to the routing table - and writing the
+/// address only when the two differed, which says nothing without a tunnel up.
+/// `resolvers` answers it directly by comparing every provider against a
+/// reference resolver, so the same test now holds with or without a VPN.
 fn pin_substituted_hosts(namespaces: &[&str], if_index: u32) -> Result<Vec<String>, String> {
-    let server: Ipv4Addr = egress::NS_V4[0]
-        .parse()
-        .map_err(|_| "неверный адрес резолвера".to_string())?;
-
     let mut entries = Vec::new();
     for ns in namespaces {
-        let isp = dns_client::resolve_a_via(ns, server, if_index).unwrap_or_default();
-        if isp.is_empty() {
+        let Some((addrs, _, verdict)) = resolvers::resolve_a_best(ns, if_index) else {
+            continue;
+        };
+        if verdict != resolvers::Verdict::Substituted {
             continue;
         }
-        let tunnelled = dns_client::resolve_a_via(ns, server, 0).unwrap_or_default();
-        if tunnelled.is_empty() || isp.iter().any(|a| tunnelled.contains(a)) {
-            continue;
-        }
-        entries.push((ns.to_string(), isp[0]));
+        entries.push((ns.to_string(), addrs[0]));
     }
 
     let pinned = entries.iter().map(|(h, _)| h.clone()).collect();
@@ -482,6 +486,7 @@ pub fn refresh_pinned_hosts() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
 
     #[test]
     fn a_foreign_rule_on_one_of_our_names_is_a_conflict() {
@@ -530,12 +535,18 @@ mod tests {
         );
         // The direct resolvers stay on as fallbacks, IPv6 does not: Windows
         // could pick it and the query would leave through the tunnel.
-        assert!(list.contains(egress::NS_V4[0]));
-        assert!(!list.contains(egress::NS_V6[0]));
+        assert!(list.contains(resolvers::PROVIDERS[0].v4[0]));
+        assert!(!list.contains(resolvers::all_v6()[0]));
 
         let direct = nameserver_list(false);
         assert!(!direct.contains(dns_forwarder::LISTEN_IP));
-        assert!(direct.contains(egress::NS_V6[0]));
+        assert!(direct.contains(resolvers::all_v6()[0]));
+
+        // Every provider has to appear as a fallback, not just the first one:
+        // a provider that stops substituting must have somewhere to fall to.
+        for p in resolvers::PROVIDERS {
+            assert!(list.contains(p.v4[0]), "{} missing from {}", p.name, list);
+        }
     }
 
     /// The end-to-end path this machine can actually exercise: resolve through
@@ -558,13 +569,15 @@ mod tests {
             eg.as_ref().map(|e| e.vpn_active)
         );
         if let Some(eg) = &eg {
-            let server: Ipv4Addr = egress::NS_V4[0].parse().unwrap();
+            let server: Ipv4Addr = resolvers::PROVIDERS[0].v4[0].parse().unwrap();
             for ns in AG_NRPT_CORE {
                 println!(
-                    "  {}\n    isp={:?}\n    tun={:?}",
+                    "  {}\n    isp={:?}\n    tun={:?}\n    best={:?}",
                     ns,
-                    dns_client::resolve_a_via(ns, server, eg.if_index),
-                    dns_client::resolve_a_via(ns, server, 0)
+                    crate::dns_client::resolve_a_via(ns, server, eg.if_index),
+                    crate::dns_client::resolve_a_via(ns, server, 0),
+                    resolvers::resolve_a_best(ns, eg.if_index)
+                        .map(|(a, p, v)| format!("{:?} via {} {:?}", a, p, v))
                 );
             }
         }

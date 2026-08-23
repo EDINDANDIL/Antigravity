@@ -16,10 +16,12 @@ use std::time::{Duration, Instant};
 // and IPv6 literals only, no CNAME chains.
 
 const DNS_PORT: u16 = 53;
+#[allow(dead_code)]
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Transaction IDs only have to differ between concurrent queries; a counter is
 /// enough and keeps the crate free of a random-number dependency.
+#[allow(dead_code)]
 static NEXT_ID: AtomicU16 = AtomicU16::new(0x1234);
 
 #[cfg(target_os = "windows")]
@@ -66,7 +68,7 @@ mod sys {
     }
 }
 
-fn build_query(name: &str, id: u16) -> Vec<u8> {
+pub fn build_query(name: &str, id: u16) -> Vec<u8> {
     let mut q = Vec::with_capacity(name.len() + 18);
     q.extend_from_slice(&id.to_be_bytes());
     q.extend_from_slice(&[0x01, 0x00]); // standard query, recursion desired
@@ -101,6 +103,7 @@ fn skip_name(buf: &[u8], mut i: usize) -> Option<usize> {
 
 /// Every A record in the answer section. Anything malformed ends the walk
 /// instead of panicking - this parses bytes from a third-party resolver.
+#[allow(dead_code)]
 fn parse_a_records(buf: &[u8], expect_id: u16) -> Vec<Ipv4Addr> {
     let mut out = Vec::new();
     if buf.len() < 12 || u16::from_be_bytes([buf[0], buf[1]]) != expect_id {
@@ -137,6 +140,69 @@ fn parse_a_records(buf: &[u8], expect_id: u16) -> Vec<Ipv4Addr> {
         i += rdlen;
     }
     out
+}
+
+/// Every address in the answer section, A and AAAA alike, with no id check -
+/// the caller already matched the id when it accepted the packet.
+///
+/// The relay needs this to tell a substituted answer from a genuine one, which
+/// is a question about addresses rather than about one record type: the routed
+/// names are asked for both families and a resolver may substitute only one.
+pub fn answer_addrs(buf: &[u8]) -> Vec<IpAddr> {
+    let mut out = Vec::new();
+    if buf.len() < 12 {
+        return out;
+    }
+    let answers = u16::from_be_bytes([buf[6], buf[7]]) as usize;
+    let questions = u16::from_be_bytes([buf[4], buf[5]]) as usize;
+
+    let mut i = 12;
+    for _ in 0..questions {
+        match skip_name(buf, i) {
+            Some(next) => i = next + 4,
+            None => return out,
+        }
+    }
+
+    for _ in 0..answers {
+        i = match skip_name(buf, i) {
+            Some(next) => next,
+            None => return out,
+        };
+        if i + 10 > buf.len() {
+            return out;
+        }
+        let rtype = u16::from_be_bytes([buf[i], buf[i + 1]]);
+        let rdlen = u16::from_be_bytes([buf[i + 8], buf[i + 9]]) as usize;
+        i += 10;
+        if i + rdlen > buf.len() {
+            return out;
+        }
+        match (rtype, rdlen) {
+            (1, 4) => out.push(IpAddr::V4(Ipv4Addr::new(
+                buf[i],
+                buf[i + 1],
+                buf[i + 2],
+                buf[i + 3],
+            ))),
+            (28, 16) => {
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&buf[i..i + 16]);
+                out.push(IpAddr::V6(std::net::Ipv6Addr::from(octets)));
+            }
+            _ => {}
+        }
+        i += rdlen;
+    }
+    out
+}
+
+/// The qtype of the question. Only A and AAAA answers can be compared against a
+/// reference resolver, so the relay has to know which it is looking at.
+pub fn question_type(buf: &[u8]) -> Option<u16> {
+    let end = skip_name(buf, 12)?;
+    let bytes = buf.get(end..end + 2)?;
+    Some(u16::from_be_bytes([bytes[0], bytes[1]]))
 }
 
 /// The question name of a query, for logging. Cheap enough to run per packet
@@ -213,6 +279,12 @@ pub fn query_raw_via(
 /// Asks `server` for the A records of `host`, forcing the query out of
 /// `if_index`. Pass 0 to let the routing table pick - useful for comparing what
 /// the same resolver answers on the two paths.
+///
+/// Production traffic goes through `resolvers`, which races every provider and
+/// classifies the answers. This single-resolver primitive is what the live
+/// `--ignored` diagnostics use to put a direct question to one named server, so
+/// it and its helpers are dead code in a normal build on purpose.
+#[allow(dead_code)]
 pub fn resolve_a_via(host: &str, server: Ipv4Addr, if_index: u32) -> Result<Vec<Ipv4Addr>, String> {
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let reply = query_raw_via(&build_query(host, id), server, if_index, TIMEOUT)?;

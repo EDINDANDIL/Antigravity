@@ -19,6 +19,7 @@ mod hosts_pin;
 mod patch_binary;
 mod patch_gemini;
 mod patch_ide;
+mod resolvers;
 mod utils;
 
 use asar::extract_asar;

@@ -23,10 +23,11 @@ use crate::utils::powershell;
 // still leaves through the named interface. So this module only has to say
 // which interface that is; `hosts_pin` does the rest.
 
-/// xbox-dns.ru resolvers. Single source of truth - `dns.rs` builds the NRPT
-/// nameserver list from these and resolves through the first one directly.
-pub const NS_V4: &[&str] = &["111.88.96.50", "111.88.96.51"];
-pub const NS_V6: &[&str] = &["2a00:ab00:1233:26::50", "2a00:ab00:1233:26::51"];
+// The resolver addresses used to live here as a single xbox-dns.ru pair. They
+// now live in `resolvers`, which holds several providers and picks between them
+// per query - a hardcoded pair cannot notice that a provider stopped
+// substituting a name, which is exactly how the tool broke. This module is back
+// to its one job: naming the interface those queries must leave through.
 
 /// Prefixes an earlier build pinned to the physical adapter. They are harmless
 /// but pointless, and the persistent ones outlive the tool, so cleanup drops
@@ -146,7 +147,7 @@ mod tests {
     #[ignore = "needs a live network; run with --ignored"]
     fn resolves_past_the_tunnel() {
         let eg = detect().expect("physical egress");
-        let server: Ipv4Addr = NS_V4[0].parse().unwrap();
+        let server: Ipv4Addr = crate::resolvers::PROVIDERS[0].v4[0].parse().unwrap();
         let host = "cloudcode-pa.googleapis.com";
         let isp = dns_client::resolve_a_via(host, server, eg.if_index);
         let tunnelled = dns_client::resolve_a_via(host, server, 0);

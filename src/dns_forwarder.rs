@@ -1,6 +1,6 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::net::{Ipv4Addr, UdpSocket};
+use std::net::UdpSocket;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::thread;
@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use crate::dns_client;
 use crate::egress;
+use crate::resolvers::{self, Verdict};
 
 // A loopback DNS relay, so the answers stay fresh.
 //
@@ -54,7 +55,18 @@ pub fn detach_console() {
 #[cfg(not(target_os = "windows"))]
 pub fn detach_console() {}
 
-const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(4);
+/// Log prefix for what the answer turned out to be. `substituted` is the only
+/// one that means the region gate is actually being defeated for that name;
+/// `PASSTHROUGH` shouts because it is the failure the old `ok` used to hide.
+fn verdict_tag(v: Verdict) -> &'static str {
+    match v {
+        Verdict::Substituted => "substituted",
+        Verdict::Sibling => "sibling",
+        Verdict::Passthrough => "PASSTHROUGH",
+        Verdict::Unknown => "ok",
+    }
+}
+
 /// How long a *detected* interface is trusted. Long on purpose: detection
 /// shells out to PowerShell, and an interface that dies is caught by
 /// `invalidate_interface()` on the first failed relay, so re-probing on a timer
@@ -129,20 +141,24 @@ fn isp_interface() -> u32 {
     idx
 }
 
-fn relay(query: &[u8]) -> Option<Vec<u8>> {
+/// Relays one query and reports which provider answered and whether that answer
+/// was actually substituted.
+///
+/// The choice is no longer a constant. A provider can drop a name from its
+/// list without any error - the query still resolves, just to the genuine
+/// Google address - so every provider is asked at once and compared against a
+/// reference resolver that substitutes nothing. See `resolvers`.
+fn relay(query: &[u8]) -> Option<(Vec<u8>, &'static str, resolvers::Verdict)> {
     let if_index = isp_interface();
-    for server in egress::NS_V4 {
-        let Ok(ip) = server.parse::<Ipv4Addr>() else {
-            continue;
-        };
-        if let Ok(reply) = dns_client::query_raw_via(query, ip, if_index, UPSTREAM_TIMEOUT) {
-            return Some(reply);
+    match resolvers::resolve_best(query, if_index) {
+        Some(hit) => Some(hit),
+        None => {
+            // Nobody answered: the interface may have gone away under us, so
+            // the next query re-detects instead of retrying a dead one.
+            invalidate_interface();
+            None
         }
     }
-    // Both resolvers silent: the interface may have gone away under us, so the
-    // next query re-detects instead of retrying a dead one.
-    invalidate_interface();
-    None
 }
 
 /// Runs until killed. Never returns `Ok` - the only way out is a bind failure,
@@ -177,11 +193,20 @@ pub fn run() -> Result<(), String> {
         thread::spawn(move || {
             let name = dns_client::question_name(&query).unwrap_or_else(|| "?".to_string());
             match relay(&query) {
-                Some(reply) => {
+                Some((reply, provider, verdict)) => {
                     out.send_to(&reply, from).ok();
-                    log(&format!("ok   {}", name));
+                    // The verdict is the part worth logging: "ok" used to mean
+                    // only that bytes came back, which is precisely what it
+                    // still said while the answers had stopped being
+                    // substituted.
+                    log(&format!(
+                        "{:<12} {} [{}]",
+                        verdict_tag(verdict),
+                        name,
+                        provider
+                    ));
                 }
-                None => log(&format!("fail {}", name)),
+                None => log(&format!("fail         {}", name)),
             }
         });
     }
@@ -190,6 +215,7 @@ pub fn run() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
 
     #[test]
     fn the_listener_address_is_loopback() {
@@ -237,30 +263,71 @@ mod tests {
         assert!(EGRESS_RETRY <= Duration::from_secs(60));
     }
 
-    /// Relays a real query end to end through the running upstream. Needs a live
-    /// network; the point is that raw bytes in produce a usable answer out.
+    /// Relays a real query end to end through the running upstream, and prints
+    /// the verdict for every routed name.
+    ///
+    /// Needs a live network and the VPN OFF: through a tunnel every provider
+    /// sees a foreign client and substitutes nothing, so every verdict comes
+    /// back `Passthrough` and the run says nothing about the providers.
+    ///
+    /// The verdict is the assertion that matters now. The old version only
+    /// checked that bytes came back - which stayed true through the whole
+    /// outage that motivated `resolvers`, because an unsubstituted answer is
+    /// still a perfectly well-formed answer.
     #[test]
-    #[ignore = "needs a live network; run with --ignored"]
+    #[ignore = "needs a live network, VPN off; run with --ignored"]
     fn relays_a_real_query() {
         let id: u16 = 0x4242;
-        let mut query = vec![];
-        query.extend_from_slice(&id.to_be_bytes());
-        query.extend_from_slice(&[0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
-        for label in "cloudcode-pa.googleapis.com".split('.') {
-            query.push(label.len() as u8);
-            query.extend_from_slice(label.as_bytes());
-        }
-        query.extend_from_slice(&[0, 0x00, 0x01, 0x00, 0x01]);
+        let mut substituted = Vec::new();
 
-        let reply = relay(&query).expect("upstream answered");
-        assert_eq!(&reply[0..2], &id.to_be_bytes(), "id must be echoed");
-        let answers = u16::from_be_bytes([reply[6], reply[7]]);
-        println!("reply {} bytes, {} answers", reply.len(), answers);
-        assert!(answers > 0, "the reply carries no answer");
-        assert_eq!(
-            dns_client::question_name(&reply).as_deref(),
-            Some("cloudcode-pa.googleapis.com"),
-            "the reply must answer the question we asked"
+        for name in [
+            "cloudcode-pa.googleapis.com",
+            "daily-cloudcode-pa.googleapis.com",
+            "generativelanguage.googleapis.com",
+            "antigravity-unleash.goog",
+        ] {
+            let mut query = vec![];
+            query.extend_from_slice(&id.to_be_bytes());
+            query.extend_from_slice(&[0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+            for label in name.split('.') {
+                query.push(label.len() as u8);
+                query.extend_from_slice(label.as_bytes());
+            }
+            query.extend_from_slice(&[0, 0x00, 0x01, 0x00, 0x01]);
+
+            let (reply, provider, verdict) = relay(&query).expect("a provider answered");
+            assert_eq!(&reply[0..2], &id.to_be_bytes(), "id must be echoed");
+            assert_eq!(
+                dns_client::question_name(&reply).as_deref(),
+                Some(name),
+                "the reply must answer the question we asked"
+            );
+            assert!(
+                u16::from_be_bytes([reply[6], reply[7]]) > 0,
+                "{} came back with no answer",
+                name
+            );
+            println!(
+                "{:<38} {:?} via {:<12} {:?}",
+                name,
+                verdict,
+                provider,
+                dns_client::answer_addrs(&reply)
+            );
+            if verdict == Verdict::Substituted {
+                substituted.push(name);
+            }
+        }
+
+        // Not an assertion on any single name: which names a provider proxies
+        // is theirs to change, and this test exists to report that, not to fail
+        // on it. But if nothing at all is substituted, either the VPN is up or
+        // every provider has dropped the whole list - both worth failing on.
+        assert!(
+            !substituted.is_empty(),
+            "no routed name is substituted by any provider - VPN up, or the \
+             providers dropped every name"
         );
+        println!("substituted: {:?}", substituted);
     }
 }
